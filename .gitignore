@@ -3,3 +3,4 @@
 /lists
 *.bat
 *.dll
+/dist

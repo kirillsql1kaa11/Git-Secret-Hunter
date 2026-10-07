@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-dist
+          Copy-Item target/release/git-secret-hunter.exe release-dist/
+          Copy-Item README.md release-dist/
+          Copy-Item LICENSE release-dist/
+          Compress-Archive -Path release-dist/* -DestinationPath git-secret-hunter-windows-x64.zip
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: git-secret-hunter-windows-x64.zip
+          generate_release_notes: true
