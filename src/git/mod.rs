@@ -1,3 +1,3 @@
 pub mod collector;
 
-pub use collector::GitEngine;
+pub use collector::{CollectLimits, DiffLine, GitCommitDiff, GitEngine, HistoryScan};

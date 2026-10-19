@@ -39,46 +39,154 @@ pub fn calculate_shannon_entropy(input: &str) -> f64 {
     sum / total_f64
 }
 
-pub fn is_candidate_entropy_token(word: &str, min_len: usize) -> bool {
-    if word.len() < min_len || word.len() > 256 {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateFamily {
+    Hex,
+    Base64,
+    Alnum,
+    Dotted,
+}
+
+impl CandidateFamily {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CandidateFamily::Hex => "hex",
+            CandidateFamily::Base64 => "base64",
+            CandidateFamily::Alnum => "alnum",
+            CandidateFamily::Dotted => "dotted",
+        }
     }
+}
 
-    let trimmed = word.trim_matches(|c: char| {
-        c == '"'
-            || c == '\''
-            || c == '`'
-            || c == ';'
-            || c == ','
-            || c == ':'
-            || c == '('
-            || c == ')'
-            || c == '{'
-            || c == '}'
-            || c == '['
-            || c == ']'
-            || c == '<'
-            || c == '>'
-            || c == '='
-    });
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub value: String,
+    pub family: CandidateFamily,
+    pub entropy: f64,
+    pub total_bits: f64,
+}
 
-    if trimmed.len() < min_len {
-        return false;
-    }
+const MIN_BITS: f64 = 64.0;
+const HEX_MIN_ENTROPY: f64 = 3.0;
+const ALNUM_MIN_ENTROPY: f64 = 3.5;
 
-    let bytes = trimmed.as_bytes();
-    let mut has_alpha = false;
-    let mut has_digit = false;
+pub fn classify_family(value: &str) -> CandidateFamily {
+    let mut hex_only = value.len() >= 16;
+    let mut has_symbol = false;
+    let mut dots = 0;
 
-    for &b in bytes {
-        if (b'a'..=b'z').contains(&b) || (b'A'..=b'Z').contains(&b) {
-            has_alpha = true;
-        } else if (b'0'..=b'9').contains(&b) {
-            has_digit = true;
-        } else if b != b'-' && b != b'_' && b != b'.' && b != b'/' && b != b'+' && b != b'=' {
-            return false;
+    for b in value.bytes() {
+        match b {
+            b'0'..=b'9' => {}
+            b'a'..=b'f' | b'A'..=b'F' => {}
+            b'+' | b'/' | b'=' | b'-' | b'_' => {
+                has_symbol = true;
+                hex_only = false;
+            }
+            b'.' => {
+                has_symbol = true;
+                hex_only = false;
+                dots += 1;
+            }
+            _ => hex_only = false,
         }
     }
 
-    has_alpha && has_digit
+    if hex_only {
+        CandidateFamily::Hex
+    } else if dots > 0 {
+        CandidateFamily::Dotted
+    } else if has_symbol {
+        CandidateFamily::Base64
+    } else {
+        CandidateFamily::Alnum
+    }
+}
+
+pub fn analyze_candidate(
+    value: &str,
+    entropy_threshold: f64,
+    dotted_allowed: bool,
+) -> Option<Candidate> {
+    let len = value.len();
+    if len < 8 || len > 256 {
+        return None;
+    }
+
+    let mut has_digit = false;
+    let mut has_letter = false;
+    let mut has_symbol = false;
+    let mut hex_only = true;
+    let mut dots = 0;
+    let mut digits = 0;
+
+    for b in value.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                has_digit = true;
+                digits += 1;
+            }
+            b'a'..=b'f' => has_letter = true,
+            b'g'..=b'z' => {
+                has_letter = true;
+                hex_only = false;
+            }
+            b'A'..=b'F' => has_letter = true,
+            b'G'..=b'Z' => {
+                has_letter = true;
+                hex_only = false;
+            }
+            b'+' | b'/' | b'=' | b'-' | b'_' => {
+                has_symbol = true;
+                hex_only = false;
+            }
+            b'.' => {
+                has_symbol = true;
+                hex_only = false;
+                dots += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    if !has_digit || !has_letter {
+        return None;
+    }
+
+    let entropy = calculate_shannon_entropy(value);
+    let total_bits = entropy * len as f64;
+
+    if total_bits < MIN_BITS {
+        return None;
+    }
+
+    let family = if hex_only {
+        CandidateFamily::Hex
+    } else if dots > 0 {
+        CandidateFamily::Dotted
+    } else if has_symbol {
+        CandidateFamily::Base64
+    } else {
+        CandidateFamily::Alnum
+    };
+
+    let accepted = match family {
+        CandidateFamily::Hex => entropy >= HEX_MIN_ENTROPY,
+        CandidateFamily::Base64 => entropy >= entropy_threshold,
+        CandidateFamily::Alnum => {
+            entropy >= (entropy_threshold - 0.5).max(ALNUM_MIN_ENTROPY) && digits >= 2
+        }
+        CandidateFamily::Dotted => dotted_allowed && entropy >= entropy_threshold,
+    };
+
+    if !accepted {
+        return None;
+    }
+
+    Some(Candidate {
+        value: value.to_string(),
+        family,
+        entropy,
+        total_bits,
+    })
 }

@@ -6,7 +6,44 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub fn render(app: &App, frame: &mut Frame) {
+const MAX_DETAIL_OCCURRENCES: usize = 8;
+
+fn severity_style(severity: Severity) -> (Style, Style) {
+    match severity {
+        Severity::Critical => (
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
+        ),
+        Severity::High => (
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Yellow),
+        ),
+        Severity::Medium => (
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Blue),
+        ),
+        Severity::Low => (
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Severity::Info => (
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
+        ),
+    }
+}
+
+fn severity_badge_text(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "[CRIT]",
+        Severity::High => "[HIGH]",
+        Severity::Medium => "[MED ]",
+        Severity::Low => "[LOW ]",
+        Severity::Info => "[INFO]",
+    }
+}
+
+pub fn render(app: &mut App, frame: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -16,25 +53,36 @@ pub fn render(app: &App, frame: &mut Frame) {
         ])
         .split(frame.area());
 
-    let (crit, high, med, low) = app.counts_by_severity();
+    let (critical, high, medium, low, info) = app.counts_by_severity();
+
     let header_text = vec![Line::from(vec![
         Span::styled(
             " GIT SECRET HUNTER ",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" | Total: "),
+        Span::raw(" | Unique: "),
         Span::styled(
             app.items.len().to_string(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" | Critical: "),
-        Span::styled(crit.to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            critical.to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" | High: "),
         Span::styled(high.to_string(), Style::default().fg(Color::Yellow)),
         Span::raw(" | Medium: "),
-        Span::styled(med.to_string(), Style::default().fg(Color::Blue)),
+        Span::styled(medium.to_string(), Style::default().fg(Color::Blue)),
         Span::raw(" | Low: "),
         Span::styled(low.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::raw(" | Info: "),
+        Span::styled(info.to_string(), Style::default().fg(Color::Cyan)),
+        Span::raw(" | Resolved: "),
+        Span::styled(
+            app.resolved_count().to_string(),
+            Style::default().fg(Color::Green),
+        ),
     ])];
 
     let header_widget = Paragraph::new(header_text).block(
@@ -53,78 +101,96 @@ pub fn render(app: &App, frame: &mut Frame) {
     let list_items: Vec<ListItem> = app
         .items
         .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let is_selected = idx == app.selected_index;
-            let (badge_text, badge_color) = match item.finding.severity {
-                Severity::Critical => ("[CRIT]", Color::Red),
-                Severity::High => ("[HIGH]", Color::Yellow),
-                Severity::Medium => ("[MED ]", Color::Blue),
-                Severity::Low => ("[LOW ]", Color::DarkGray),
-            };
-
+        .map(|item| {
+            let (badge_style, _) = severity_style(item.group.severity);
             let status_mark = if item.is_resolved { "[RESOLVED] " } else { "" };
             let status_color = if item.is_resolved { Color::Green } else { Color::Reset };
 
-            let mut style = Style::default();
-            if is_selected {
-                style = style
-                    .bg(Color::Rgb(40, 45, 60))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD);
-            }
-
             let line = Line::from(vec![
-                Span::styled(badge_text, Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
+                Span::styled(severity_badge_text(item.group.severity), badge_style),
                 Span::raw(" "),
                 Span::styled(status_mark, Style::default().fg(status_color)),
-                Span::styled(&item.finding.rule_name, Style::default().fg(Color::White)),
+                Span::styled(&item.group.rule_name, Style::default().fg(Color::White)),
                 Span::raw(" ("),
-                Span::styled(&item.finding.file_path, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    item.group
+                        .occurrences
+                        .first()
+                        .map(|occurrence| occurrence.file_path.as_str())
+                        .unwrap_or("unknown"),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(")"),
             ]);
 
-            ListItem::new(line).style(style)
+            ListItem::new(line)
         })
         .collect();
 
-    let list_widget = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Detected Secrets")
-            .border_style(Style::default().fg(Color::White)),
-    );
-    frame.render_widget(list_widget, main_chunks[0]);
+    let list_widget = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Detected Secrets (unique)")
+                .border_style(Style::default().fg(Color::White)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 45, 60))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    if app.selected_index >= app.items.len() && !app.items.is_empty() {
+        app.selected_index = app.items.len() - 1;
+    }
+    app.list_state.select(if app.items.is_empty() {
+        None
+    } else {
+        Some(app.selected_index)
+    });
+
+    frame.render_stateful_widget(list_widget, main_chunks[0], &mut app.list_state);
 
     let detail_text = if let Some(item) = app.current_item() {
-        let f = &item.finding;
+        let group = &item.group;
         let resolved_status = if item.is_resolved {
-            Span::styled("RESOLVED (MARKED)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "RESOLVED (MARKED)",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )
         } else {
-            Span::styled("ACTIVE RISK", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "ACTIVE RISK",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
         };
 
-        vec![
+        let (_, severity_color) = severity_style(group.severity);
+
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("Rule Name:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&f.rule_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &group.rule_name,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Category:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(f.category.label(), Style::default().fg(Color::Cyan)),
+                Span::styled(group.category.label(), Style::default().fg(Color::Cyan)),
             ]),
             Line::from(vec![
                 Span::styled("Severity:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(f.severity.label(), Style::default().fg(match f.severity {
-                    Severity::Critical => Color::Red,
-                    Severity::High => Color::Yellow,
-                    Severity::Medium => Color::Blue,
-                    Severity::Low => Color::DarkGray,
-                }).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    group.severity.label(),
+                    severity_color.add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Confidence:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&f.confidence, Style::default().fg(Color::Green)),
+                Span::styled(&group.confidence, Style::default().fg(Color::Green)),
             ]),
             Line::from(vec![
                 Span::styled("Audit State: ", Style::default().fg(Color::DarkGray)),
@@ -132,34 +198,93 @@ pub fn render(app: &App, frame: &mut Frame) {
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Location:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{}:{}", f.file_path, f.line_number), Style::default().fg(Color::White)),
-            ]),
-            Line::from(vec![
-                Span::styled("Commit ID:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&f.commit_id, Style::default().fg(Color::Magenta)),
-            ]),
-            Line::from(vec![
-                Span::styled("Author:      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&f.commit_author, Style::default().fg(Color::Cyan)),
-            ]),
-            Line::from(vec![
-                Span::styled("Commit Date: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&f.commit_date, Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
                 Span::styled("Secret:      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&f.secret_preview, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &group.secret_preview,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Fingerprint: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&group.fingerprint, Style::default().fg(Color::LightBlue)),
+                Span::styled(
+                    format!(" ({})", group.family),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Entropy:     ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    f.entropy.map(|e| format!("{:.2} bits", e)).unwrap_or_else(|| "N/A".to_string()),
+                    group
+                        .entropy
+                        .map(|entropy| format!("{:.2} bits", entropy))
+                        .unwrap_or_else(|| "N/A".to_string()),
                     Style::default().fg(Color::LightBlue),
                 ),
             ]),
-        ]
+            Line::from(vec![
+                Span::styled("History:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "{} commit(s), {} file(s)",
+                        group.commit_count, group.file_count
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("First seen:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&group.first_seen, Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Last seen:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&group.last_seen, Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Occurrences:",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            )),
+        ];
+
+        for occurrence in group.occurrences.iter().take(MAX_DETAIL_OCCURRENCES) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    occurrence
+                        .commit_id
+                        .get(..10)
+                        .unwrap_or(occurrence.commit_id.as_str())
+                        .to_string(),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "{}:{}",
+                        occurrence.file_path, occurrence.line_number
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    occurrence.commit_date.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+
+        if group.occurrences.len() > MAX_DETAIL_OCCURRENCES {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  ... and {} more occurrence(s)",
+                    group.occurrences.len() - MAX_DETAIL_OCCURRENCES
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        lines
     } else {
         vec![Line::from("No findings selected")]
     };
@@ -180,8 +305,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         Span::styled(" [↓/j] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("Down  "),
         Span::styled(" [Space] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw("Toggle Resolved  "),
-        Span::styled(" [q / Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::raw("Toggle Resolved (saved)  "),
+        Span::styled(" [q/Ctrl+C] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         Span::raw("Exit TUI"),
     ]);
 

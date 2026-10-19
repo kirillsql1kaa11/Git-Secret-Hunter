@@ -6,6 +6,64 @@ pub enum ContextScore {
     FalsePositive,
 }
 
+const HASH_CONTEXT_MARKERS: [&str; 24] = [
+    "sha1",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "sha-1",
+    "sha-256",
+    "md5",
+    "checksum",
+    "check_sum",
+    "integrity",
+    "etag",
+    "digest",
+    "objectid",
+    "object_id",
+    "uuid",
+    "guid",
+    "correlation",
+    "trace_id",
+    "traceid",
+    "request_id",
+    "requestid",
+    "span_id",
+    "commit",
+];
+
+const SECRET_KEYWORDS: [&str; 28] = [
+    "api_key",
+    "apikey",
+    "api-key",
+    "secret",
+    "token",
+    "bearer",
+    "auth",
+    "credentials",
+    "credential",
+    "password",
+    "passwd",
+    "private_key",
+    "private key",
+    "access_key",
+    "secret_key",
+    "ssh",
+    "hash",
+    "sig",
+    "signature",
+    "dsn",
+    "connection_string",
+    "connectionstring",
+    "database_url",
+    "webhook",
+    "smtp",
+    "client_secret",
+    "encryption_key",
+    "salt",
+];
+
 pub fn is_ignored_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_lowercase();
 
@@ -99,19 +157,32 @@ pub fn is_ignored_path(path: &str) -> bool {
     false
 }
 
-pub fn evaluate_context(line: &str, file_path: &str, token: &str) -> ContextScore {
-    let lower_line = line.to_lowercase();
-    let lower_path = file_path.to_lowercase();
-    let lower_token = token.to_lowercase();
+pub fn has_hash_context(line_lower: &str) -> bool {
+    HASH_CONTEXT_MARKERS
+        .iter()
+        .any(|marker| line_lower.contains(marker))
+}
 
-    if is_false_positive_token(&lower_token) {
+pub fn has_secret_keyword(line_lower: &str) -> bool {
+    SECRET_KEYWORDS
+        .iter()
+        .any(|keyword| line_lower.contains(keyword))
+}
+
+pub fn evaluate_context(line: &str, file_path: &str, token: &str) -> ContextScore {
+    let line_lower = line.to_lowercase();
+    let path_lower = file_path.to_lowercase();
+    let token_lower = token.to_lowercase();
+
+    evaluate_context_lower(&line_lower, &path_lower, &token_lower)
+}
+
+pub fn evaluate_context_lower(line_lower: &str, path_lower: &str, token_lower: &str) -> ContextScore {
+    if is_false_positive_token(token_lower, has_hash_context(line_lower)) {
         return ContextScore::FalsePositive;
     }
 
-    let is_test_environment = lower_path.contains("test")
-        || lower_path.contains("fixture")
-        || lower_path.contains("mock")
-        || lower_path.contains("spec");
+    let is_test_environment = is_test_path(path_lower);
 
     let mock_indicators = [
         "mock",
@@ -125,7 +196,7 @@ pub fn evaluate_context(line: &str, file_path: &str, token: &str) -> ContextScor
     ];
 
     for indicator in mock_indicators {
-        if lower_line.contains(indicator) {
+        if line_lower.contains(indicator) {
             return if is_test_environment {
                 ContextScore::FalsePositive
             } else {
@@ -134,27 +205,13 @@ pub fn evaluate_context(line: &str, file_path: &str, token: &str) -> ContextScor
         }
     }
 
-    let secret_keywords = [
-        "api_key",
-        "apikey",
-        "secret",
-        "token",
-        "bearer",
-        "auth",
-        "credentials",
-        "password",
-        "private_key",
-    ];
-
-    for kw in secret_keywords {
-        if lower_line.contains(kw) {
-            return ContextScore::HighConfidence;
-        }
+    if has_secret_keyword(line_lower) {
+        return ContextScore::HighConfidence;
     }
 
-    if lower_path.ends_with(".env")
-        || lower_path.contains(".env.")
-        || lower_path.ends_with("credentials.json")
+    if path_lower.ends_with(".env")
+        || path_lower.contains(".env.")
+        || path_lower.ends_with("credentials.json")
     {
         return ContextScore::HighConfidence;
     }
@@ -166,9 +223,14 @@ pub fn evaluate_context(line: &str, file_path: &str, token: &str) -> ContextScor
     }
 }
 
-pub fn is_false_positive_token(token: &str) -> bool {
-    let lower = token.to_lowercase();
+pub fn is_test_path(path_lower: &str) -> bool {
+    path_lower.contains("test")
+        || path_lower.contains("fixture")
+        || path_lower.contains("mock")
+        || path_lower.contains("spec")
+}
 
+pub fn is_false_positive_token(token_lower: &str, hash_context: bool) -> bool {
     let dummy_words = [
         "example",
         "dummy",
@@ -185,20 +247,43 @@ pub fn is_false_positive_token(token: &str) -> bool {
     ];
 
     for dummy in dummy_words {
-        if lower.contains(dummy) {
+        if token_lower.contains(dummy) {
             return true;
         }
     }
 
-    if is_uuid(&lower) {
+    let subresource_integrity_prefixes = ["sha1-", "sha256-", "sha384-", "sha512-", "md5-", "sha3-"];
+    for prefix in subresource_integrity_prefixes {
+        if token_lower.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    if is_uuid(token_lower) {
         return true;
     }
 
-    if is_pure_hex_hash(&lower) {
+    if is_single_char_run(token_lower) {
+        return true;
+    }
+
+    if hash_context && is_hex_token(token_lower) {
         return true;
     }
 
     false
+}
+
+pub fn is_hex_token(token_lower: &str) -> bool {
+    (32..=128).contains(&token_lower.len()) && token_lower.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_single_char_run(token_lower: &str) -> bool {
+    let mut chars = token_lower.chars();
+    match chars.next() {
+        Some(first) => chars.all(|c| c == first),
+        None => false,
+    }
 }
 
 fn is_uuid(s: &str) -> bool {
@@ -213,9 +298,4 @@ fn is_uuid(s: &str) -> bool {
         && parts[3].len() == 4
         && parts[4].len() == 12
         && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-fn is_pure_hex_hash(s: &str) -> bool {
-    (s.len() == 32 || s.len() == 40 || s.len() == 64)
-        && s.chars().all(|c| c.is_ascii_hexdigit())
 }

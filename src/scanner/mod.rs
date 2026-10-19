@@ -1,11 +1,22 @@
+pub mod candidates;
 pub mod entropy;
 pub mod filters;
+pub mod grouping;
 pub mod rules;
 
-use entropy::{calculate_shannon_entropy, is_candidate_entropy_token};
-use filters::{evaluate_context, is_false_positive_token, is_ignored_path, ContextScore};
-use rules::{RuleCategory, RuleRegistry, Severity};
+use candidates::extract_candidates;
+use entropy::{analyze_candidate, calculate_shannon_entropy, classify_family};
+use filters::{
+    evaluate_context_lower, has_hash_context, has_secret_keyword, is_false_positive_token,
+    is_ignored_path, ContextScore,
+};
+use rules::{RuleCategory, RuleRegistry};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+
+pub use grouping::{FindingGroup, Occurrence, group_findings};
+pub use rules::Severity;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
@@ -14,6 +25,8 @@ pub struct Finding {
     pub category: RuleCategory,
     pub severity: Severity,
     pub confidence: String,
+    pub fingerprint: String,
+    pub family: String,
     pub secret_preview: String,
     pub commit_id: String,
     pub commit_author: String,
@@ -25,6 +38,7 @@ pub struct Finding {
 
 pub struct Scanner {
     pub registry: RuleRegistry,
+    pub ai_only: bool,
     pub check_entropy: bool,
     pub entropy_threshold: f64,
     pub min_entropy_len: usize,
@@ -39,6 +53,7 @@ impl Scanner {
     ) -> Self {
         Self {
             registry: RuleRegistry::new(ai_only),
+            ai_only,
             check_entropy,
             entropy_threshold,
             min_entropy_len,
@@ -58,120 +73,191 @@ impl Scanner {
             return Vec::new();
         }
 
+        let line_lower = line.to_lowercase();
+        let path_lower = file_path.to_lowercase();
+        let hash_context = has_hash_context(&line_lower);
+        let secret_keyword = has_secret_keyword(&line_lower);
         let mut findings = Vec::new();
 
-        for rule in &self.registry.rules {
-            for m in rule.regex.find_iter(line) {
-                let matched_text = m.as_str();
+        let mut matches: Vec<(&rules::DetectionRule, String, usize)> = Vec::new();
 
-                let context_score = evaluate_context(line, file_path, matched_text);
-                if context_score == ContextScore::FalsePositive {
+        for position in self.registry.matching_indices(line) {
+            let rule = &self.registry.rules[position];
+
+            for matched in rule.regex.find_iter(line) {
+                if matched.as_str().is_empty() {
                     continue;
                 }
 
-                let severity = match context_score {
+                matches.push((rule, matched.as_str().to_string(), matched.start()));
+            }
+        }
+
+        let specific_spans: Vec<(usize, usize)> = matches
+            .iter()
+            .filter(|(rule, _, _)| rule.category.is_specific())
+            .map(|(_, value, start)| (*start, *start + value.len()))
+            .collect();
+
+        matches.retain(|(rule, value, start)| {
+            rule.category.is_specific()
+                || !specific_spans
+                    .iter()
+                    .any(|(span_start, span_end)| start >= span_start && start + value.len() <= *span_end)
+        });
+
+        for (rule, value, _) in &matches {
+            let context = evaluate_context_lower(&line_lower, &path_lower, &value.to_lowercase());
+
+            if context == ContextScore::FalsePositive {
+                continue;
+            }
+
+            if rule.suppress_in_hash_context {
+                if hash_context && !secret_keyword {
+                    continue;
+                }
+
+                if calculate_shannon_entropy(value) < 3.0 {
+                    continue;
+                }
+
+                if is_false_positive_token(&value.to_lowercase(), hash_context) {
+                    continue;
+                }
+
+                if value.eq_ignore_ascii_case(commit_id) {
+                    continue;
+                }
+            }
+
+            let severity = if context == ContextScore::LowConfidence {
+                Severity::Low
+            } else {
+                rule.severity
+            };
+
+            findings.push(Finding {
+                rule_id: rule.id.to_string(),
+                rule_name: rule.name.to_string(),
+                category: rule.category,
+                severity,
+                confidence: context_label(context).to_string(),
+                fingerprint: fingerprint_of(value),
+                family: classify_family(value).label().to_string(),
+                secret_preview: mask_secret(value),
+                commit_id: commit_id.to_string(),
+                commit_author: commit_author.to_string(),
+                commit_date: commit_date.to_string(),
+                file_path: file_path.to_string(),
+                    line_number,
+                entropy: Some(calculate_shannon_entropy(value)),
+            });
+        }
+
+        if self.check_entropy && !self.ai_only {
+            for candidate in extract_candidates(line, self.min_entropy_len) {
+                let candidate_lower = candidate.to_lowercase();
+
+                if is_false_positive_token(&candidate_lower, hash_context) {
+                    continue;
+                }
+
+                if candidate.eq_ignore_ascii_case(commit_id) {
+                    continue;
+                }
+
+                let analysis = match analyze_candidate(&candidate, self.entropy_threshold, secret_keyword) {
+                    Some(analysis) => analysis,
+                    None => continue,
+                };
+
+                if findings
+                    .iter()
+                    .any(|finding| finding.fingerprint == fingerprint_of(&candidate))
+                {
+                    continue;
+                }
+
+                let context = evaluate_context_lower(&line_lower, &path_lower, &candidate_lower);
+
+                if context == ContextScore::FalsePositive {
+                    continue;
+                }
+
+                let severity = match context {
                     ContextScore::LowConfidence => Severity::Low,
-                    _ => rule.severity,
+                    ContextScore::HighConfidence => Severity::High,
+                    _ => Severity::Medium,
                 };
-
-                let confidence = match context_score {
-                    ContextScore::HighConfidence => "HIGH".to_string(),
-                    ContextScore::Normal => "NORMAL".to_string(),
-                    ContextScore::LowConfidence => "LOW".to_string(),
-                    ContextScore::FalsePositive => "NONE".to_string(),
-                };
-
-                let ent = calculate_shannon_entropy(matched_text);
-                let preview = mask_secret(matched_text);
 
                 findings.push(Finding {
-                    rule_id: rule.id.to_string(),
-                    rule_name: rule.name.to_string(),
-                    category: rule.category,
+                    rule_id: "high-entropy-token".to_string(),
+                    rule_name: "High Entropy Random Secret".to_string(),
+                    category: RuleCategory::GenericEntropy,
                     severity,
-                    confidence,
-                    secret_preview: preview,
+                    confidence: context_label(context).to_string(),
+                    fingerprint: fingerprint_of(&candidate),
+                    family: analysis.family.label().to_string(),
+                    secret_preview: mask_secret(&candidate),
                     commit_id: commit_id.to_string(),
                     commit_author: commit_author.to_string(),
                     commit_date: commit_date.to_string(),
                     file_path: file_path.to_string(),
                     line_number,
-                    entropy: Some(ent),
+                    entropy: Some(analysis.entropy),
                 });
             }
         }
 
-        if self.check_entropy {
-            for word in line.split_whitespace() {
-                if is_candidate_entropy_token(word, self.min_entropy_len) {
-                    let cleaned = word.trim_matches(|c: char| {
-                        c == '"'
-                            || c == '\''
-                            || c == '`'
-                            || c == ';'
-                            || c == ','
-                            || c == ':'
-                            || c == '('
-                            || c == ')'
-                            || c == '{'
-                            || c == '}'
-                            || c == '['
-                            || c == ']'
-                            || c == '<'
-                            || c == '>'
-                            || c == '='
-                    });
-
-                    let context_score = evaluate_context(line, file_path, cleaned);
-                    if context_score == ContextScore::FalsePositive {
-                        continue;
-                    }
-
-                    if is_false_positive_token(cleaned) {
-                        continue;
-                    }
-
-                    let ent = calculate_shannon_entropy(cleaned);
-                    if ent >= self.entropy_threshold {
-                        let already_found = findings
-                            .iter()
-                            .any(|f| f.secret_preview.contains(&cleaned[..cleaned.len().min(6)]));
-
-                        if !already_found {
-                            let severity = match context_score {
-                                ContextScore::LowConfidence => Severity::Low,
-                                _ => Severity::Medium,
-                            };
-
-                            let confidence = match context_score {
-                                ContextScore::HighConfidence => "HIGH".to_string(),
-                                ContextScore::Normal => "NORMAL".to_string(),
-                                ContextScore::LowConfidence => "LOW".to_string(),
-                                ContextScore::FalsePositive => "NONE".to_string(),
-                            };
-
-                            findings.push(Finding {
-                                rule_id: "high-entropy-token".to_string(),
-                                rule_name: "High Entropy Random Secret".to_string(),
-                                category: RuleCategory::GenericEntropy,
-                                severity,
-                                confidence,
-                                secret_preview: mask_secret(cleaned),
-                                commit_id: commit_id.to_string(),
-                                commit_author: commit_author.to_string(),
-                                commit_date: commit_date.to_string(),
-                                file_path: file_path.to_string(),
-                                line_number,
-                                entropy: Some(ent),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        dedupe_line_findings(&mut findings);
 
         findings
     }
+}
+
+fn dedupe_line_findings(findings: &mut Vec<Finding>) {
+    let specific: Vec<String> = findings
+        .iter()
+        .filter(|finding| finding.category.is_specific())
+        .map(|finding| finding.fingerprint.clone())
+        .collect();
+
+    let mut seen: Vec<(String, String)> = Vec::new();
+
+    findings.retain(|finding| {
+        if !finding.category.is_specific() && specific.contains(&finding.fingerprint) {
+            return false;
+        }
+
+        let key = (finding.rule_id.clone(), finding.fingerprint.clone());
+        if seen.contains(&key) {
+            return false;
+        }
+
+        seen.push(key);
+        true
+    });
+}
+
+fn context_label(context: ContextScore) -> &'static str {
+    match context {
+        ContextScore::HighConfidence => "HIGH",
+        ContextScore::Normal => "NORMAL",
+        ContextScore::LowConfidence => "LOW",
+        ContextScore::FalsePositive => "NONE",
+    }
+}
+
+pub fn fingerprint_of(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut fingerprint = String::with_capacity(16);
+
+    for byte in &digest[..8] {
+        let _ = write!(fingerprint, "{:02x}", byte);
+    }
+
+    fingerprint
 }
 
 pub fn mask_secret(secret: &str) -> String {

@@ -11,7 +11,7 @@ pub enum OutputFormat {
 #[command(
     name = "git-secret-hunter",
     author = "kira0",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Blazing fast Git history secret scanner & AI API key auditor"
 )]
 pub struct Cli {
@@ -33,6 +33,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 24)]
     pub min_entropy_len: usize,
 
+    #[arg(long, default_value_t = 8192, value_name = "CHARS")]
+    pub max_line_len: usize,
+
+    #[arg(long, default_value_t = 8 * 1024 * 1024, value_name = "BYTES")]
+    pub max_file_size: usize,
+
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 
@@ -50,6 +56,9 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 10)]
     pub crawl_depth: usize,
+
+    #[arg(long, default_value_t = 4, value_name = "N")]
+    pub crawl_concurrency: usize,
 
     #[arg(long)]
     pub github_token: Option<String>,
