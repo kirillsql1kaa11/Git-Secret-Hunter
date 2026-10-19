@@ -90,6 +90,48 @@ pub fn looks_like_artifact_name(token_lower: &str) -> bool {
     EXTENSIONS.contains(&extension)
 }
 
+pub fn looks_like_checksum_line(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    if trimmed.len() < 42 || trimmed.contains('=') {
+        return false;
+    }
+
+    if trimmed.contains("-----BEGIN") {
+        return false;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+
+    let digest = first.trim_end_matches(':');
+    let is_digest = (32..=128).contains(&digest.len())
+        && digest.chars().all(|character| character.is_ascii_hexdigit());
+
+    if !is_digest {
+        return false;
+    }
+
+    let Some(file_name) = parts.next() else {
+        return false;
+    };
+
+    let file_name = file_name.trim_start_matches('*');
+
+    !file_name.is_empty() && file_name.chars().any(|character| character.is_ascii_alphanumeric())
+}
+
+pub fn looks_like_minified_line(line: &str) -> bool {
+    if line.len() < 1200 {
+        return false;
+    }
+
+    let spaces = line.bytes().filter(|byte| *byte == b' ').count();
+    spaces * 80 < line.len()
+}
+
 pub fn is_ignored_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_lowercase();
 
@@ -164,9 +206,19 @@ pub fn is_ignored_path(path: &str) -> bool {
         "cargo.lock",
         "yarn.lock",
         "pnpm-lock.yaml",
+        "bun.lockb",
         "composer.lock",
         "gemfile.lock",
         "poetry.lock",
+        "uv.lock",
+        "pipfile.lock",
+        "packages.lock.json",
+        "flake.lock",
+        "mix.lock",
+        "pubspec.lock",
+        "podfile.lock",
+        "gradle.lockfile",
+        ".terraform.lock.hcl",
         "go.sum",
         "record",
         "installer",

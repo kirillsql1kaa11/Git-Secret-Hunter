@@ -17,6 +17,7 @@ fn group(index: usize, severity: Severity) -> FindingGroup {
         family: "base64".to_string(),
         secret_preview: format!("pref...{:04}", index),
         entropy: Some(4.9),
+        verification: None,
         occurrences: vec![Occurrence {
             commit_id: format!("commit{:018}", index),
             commit_author: "Tester".to_string(),

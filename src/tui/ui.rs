@@ -223,6 +223,30 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 ),
             ]),
             Line::from(vec![
+                Span::styled("Verification:", Style::default().fg(Color::DarkGray)),
+                {
+                    let (label, color) = match group.verification.as_ref() {
+                        Some(verification) => (
+                            format!(
+                                " {} ({}; {})",
+                                verification.status.label(),
+                                verification.provider,
+                                verification.detail
+                            ),
+                            match verification.status {
+                                crate::verify::VerificationStatus::Verified => Color::Green,
+                                crate::verify::VerificationStatus::Invalid => Color::DarkGray,
+                                crate::verify::VerificationStatus::Unknown => Color::Yellow,
+                                crate::verify::VerificationStatus::Error => Color::Red,
+                            },
+                        ),
+                        None => (" not performed".to_string(), Color::DarkGray),
+                    };
+
+                    Span::styled(label, Style::default().fg(color))
+                },
+            ]),
+            Line::from(vec![
                 Span::styled("History:     ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(

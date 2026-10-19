@@ -1,5 +1,6 @@
 use crate::scanner::Finding;
 use crate::scanner::rules::{RuleCategory, Severity};
+use crate::verify::{merge_verification, Verification};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -23,6 +24,8 @@ pub struct FindingGroup {
     pub family: String,
     pub secret_preview: String,
     pub entropy: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
     pub occurrences: Vec<Occurrence>,
     pub commit_count: usize,
     pub file_count: usize,
@@ -119,6 +122,9 @@ pub fn group_findings(findings: &[Finding]) -> Vec<FindingGroup> {
                     group.secret_preview = finding.secret_preview.clone();
                     group.entropy = finding.entropy;
                 }
+
+                group.verification =
+                    merge_verification(group.verification.as_ref(), finding.verification.as_ref());
             }
             None => {
                 let position = groups.len();
@@ -133,6 +139,7 @@ pub fn group_findings(findings: &[Finding]) -> Vec<FindingGroup> {
                     family: finding.family.clone(),
                     secret_preview: finding.secret_preview.clone(),
                     entropy: finding.entropy,
+                    verification: finding.verification.clone(),
                     occurrences: vec![occurrence],
                     commit_count: 0,
                     file_count: 0,

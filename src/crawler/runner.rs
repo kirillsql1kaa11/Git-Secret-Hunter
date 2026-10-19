@@ -140,21 +140,7 @@ impl<'a> CrawlerRunner<'a> {
             Err(_) => return None,
         };
 
-        let mut findings = Vec::new();
-
-        for commit in &history.commits {
-            for diff_line in &commit.added_lines {
-                let found = self.scanner.scan_line(
-                    &diff_line.content,
-                    &diff_line.file_path,
-                    diff_line.line_number,
-                    &commit.commit_id,
-                    &commit.author,
-                    &commit.date,
-                );
-                findings.extend(found);
-            }
-        }
+        let findings = crate::audit::scan_commits_quiet(&history.commits, self.scanner);
 
         let unique_findings = group_findings(&findings).len();
 

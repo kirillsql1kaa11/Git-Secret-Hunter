@@ -1,8 +1,9 @@
 use crate::scanner::{Finding, FindingGroup};
+use crate::verify::VerificationStatus;
 use serde::Serialize;
 use std::time::Duration;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 pub struct JsonReport {
@@ -16,6 +17,8 @@ pub struct JsonReport {
     pub scan_duration_ms: u128,
     pub total_findings: usize,
     pub unique_findings: usize,
+    pub verified_findings: usize,
+    pub invalid_findings: usize,
     pub findings: Vec<Finding>,
     pub groups: Vec<FindingGroup>,
 }
@@ -45,9 +48,24 @@ pub fn build_report(
         scan_duration_ms: meta.duration.as_millis(),
         total_findings: findings.len(),
         unique_findings: groups.len(),
+        verified_findings: count_verification(groups, VerificationStatus::Verified),
+        invalid_findings: count_verification(groups, VerificationStatus::Invalid),
         findings: findings.to_vec(),
         groups: groups.to_vec(),
     }
+}
+
+fn count_verification(groups: &[FindingGroup], status: VerificationStatus) -> usize {
+    groups
+        .iter()
+        .filter(|group| {
+            group
+                .verification
+                .as_ref()
+                .map(|verification| verification.status == status)
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 pub fn print_json(

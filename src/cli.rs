@@ -48,6 +48,30 @@ pub struct Cli {
     #[arg(long)]
     pub staged: bool,
 
+    #[arg(long, help = "Check found keys against the provider API (opt-in)")]
+    pub verify: bool,
+
+    #[arg(long, help = "Also scan initialized submodules")]
+    pub submodules: bool,
+
+    #[arg(long, help = "Also scan git notes")]
+    pub notes: bool,
+
+    #[arg(long, help = "Also scan local Git LFS objects")]
+    pub lfs: bool,
+
+    #[arg(long, value_name = "DATE", help = "Only commits after this date")]
+    pub since: Option<String>,
+
+    #[arg(long, value_name = "DATE", help = "Only commits before this date")]
+    pub until: Option<String>,
+
+    #[arg(long = "range", value_name = "REV..REV", help = "Only commits in this revision range")]
+    pub rev_range: Option<String>,
+
+    #[arg(long, help = "Only scan commits added since the last recorded scan of this repository")]
+    pub incremental: bool,
+
     #[arg(long)]
     pub crawl: bool,
 
@@ -65,6 +89,27 @@ pub struct Cli {
 
     #[arg(long)]
     pub query: Option<String>,
+
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub min_stars: u32,
+
+    #[arg(long, value_name = "MB")]
+    pub max_size_mb: Option<u64>,
+
+    #[arg(long, value_name = "LANG")]
+    pub language: Option<String>,
+
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub pushed_days: u32,
+
+    #[arg(long)]
+    pub include_forks: bool,
+
+    #[arg(long)]
+    pub include_archived: bool,
+
+    #[arg(long, help = "Do not skip repositories scanned by previous runs")]
+    pub no_crawl_dedupe: bool,
 
     #[arg(long)]
     pub tui: bool,

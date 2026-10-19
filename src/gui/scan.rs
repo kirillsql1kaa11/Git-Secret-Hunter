@@ -1,7 +1,8 @@
-use crate::git::{CollectLimits, GitEngine};
+use crate::audit;
+use crate::git::{CollectLimits, CollectScope, GitEngine};
+use crate::incremental::{ScanMarkers, incremental_range, record_head};
 use crate::reporter::json::{ReportMeta, build_report};
-use crate::scanner::{group_findings, Finding, FindingGroup, Scanner};
-use rayon::prelude::*;
+use crate::scanner::{Finding, FindingGroup, Scanner, group_findings};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +21,14 @@ pub struct ScanOptions {
     pub max_commits: Option<usize>,
     pub max_line_len: usize,
     pub max_file_size: usize,
+    pub verify: bool,
+    pub include_submodules: bool,
+    pub include_notes: bool,
+    pub include_lfs: bool,
+    pub incremental: bool,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub rev_range: Option<String>,
 }
 
 impl Default for ScanOptions {
@@ -35,6 +44,14 @@ impl Default for ScanOptions {
             max_commits: None,
             max_line_len: 8192,
             max_file_size: 8 * 1024 * 1024,
+            verify: false,
+            include_submodules: false,
+            include_notes: false,
+            include_lfs: false,
+            incremental: false,
+            since: None,
+            until: None,
+            rev_range: None,
         }
     }
 }
@@ -125,19 +142,38 @@ pub fn run_scan(
         options.check_entropy,
         options.entropy_threshold,
         options.min_entropy_len,
-    );
+    )
+    .with_verification(options.verify);
 
     let limits = CollectLimits {
         max_line_len: options.max_line_len,
         max_file_size: options.max_file_size,
     };
 
+    let mut scope = CollectScope {
+        since: options.since.clone(),
+        until: options.until.clone(),
+        rev_range: options.rev_range.clone(),
+        include_submodules: options.include_submodules,
+        include_notes: options.include_notes,
+        include_lfs: options.include_lfs,
+        allow_empty: false,
+    };
+
+    let mut markers = ScanMarkers::load();
+
+    if options.incremental && !options.staged && scope.rev_range.is_none() {
+        scope.rev_range = incremental_range(&options.path, &markers);
+        scope.allow_empty = true;
+    }
+
     let engine = GitEngine::new(
         &options.path,
         options.include_dangling,
         options.max_commits,
         limits,
-    );
+    )
+    .with_scope(scope);
 
     let history = if options.staged {
         engine.collect_staged()?
@@ -147,37 +183,22 @@ pub fn run_scan(
 
     total.store(history.commits.len(), Ordering::Relaxed);
 
-    let lines = AtomicUsize::new(0);
+    let lines = history.total_lines();
 
-    let findings: Vec<Finding> = history
-        .commits
-        .par_iter()
-        .flat_map(|commit| {
-            let mut commit_findings = Vec::new();
-            lines.fetch_add(commit.added_lines.len(), Ordering::Relaxed);
+    let findings = audit::scan_commits(&history.commits, &scanner, &|| {
+        progress.fetch_add(1, Ordering::Relaxed);
+    });
 
-            for diff_line in &commit.added_lines {
-                commit_findings.extend(scanner.scan_line(
-                    &diff_line.content,
-                    &diff_line.file_path,
-                    diff_line.line_number,
-                    &commit.commit_id,
-                    &commit.author,
-                    &commit.date,
-                ));
-            }
-
-            progress.fetch_add(1, Ordering::Relaxed);
-            commit_findings
-        })
-        .collect();
+    if options.incremental && !options.staged {
+        record_head(&options.path, &mut markers);
+    }
 
     let groups = group_findings(&findings);
 
     Ok(ScanResult {
         repo_path: engine.repo_path().display().to_string(),
         commits: history.commits.len(),
-        lines: lines.load(Ordering::Relaxed),
+        lines,
         skipped_lines: history.skipped_lines,
         skipped_files: history.skipped_files,
         duration: started.elapsed(),

@@ -99,6 +99,31 @@ pub fn print_findings(groups: &[FindingGroup]) {
             println!("  {} {:.2} bits", "Entropy:   ".bright_black(), entropy);
         }
 
+        if let Some(verification) = &group.verification {
+            let status = match verification.status {
+                crate::verify::VerificationStatus::Verified => {
+                    verification.status.label().bright_green().bold()
+                }
+                crate::verify::VerificationStatus::Invalid => {
+                    verification.status.label().bright_black()
+                }
+                crate::verify::VerificationStatus::Unknown => {
+                    verification.status.label().yellow()
+                }
+                crate::verify::VerificationStatus::Error => {
+                    verification.status.label().bright_red()
+                }
+            };
+
+            println!(
+                "  {} {} ({}; {})",
+                "Verification:".bright_black(),
+                status,
+                verification.provider.bright_white(),
+                verification.detail
+            );
+        }
+
         for occurrence in group.occurrences.iter().take(MAX_OCCURRENCES_SHOWN) {
             println!(
                 "      {} {} {}:{}",

@@ -1,4 +1,5 @@
-use git_secret_hunter::git::{CollectLimits, GitEngine};
+use git_secret_hunter::git::{CollectLimits, CollectScope, GitEngine};
+use git_secret_hunter::incremental::{ScanMarkers, incremental_range, record_head};
 use git_secret_hunter::scanner::{group_findings, Scanner};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -290,4 +291,271 @@ fn test_limits_cap_lines_and_file_budget() {
     );
 
     assert!(group_findings(&findings).len() >= 1);
+}
+
+fn scan_history(history: &git_secret_hunter::git::HistoryScan) -> Vec<git_secret_hunter::scanner::Finding> {
+    let scanner = Scanner::new(false, true, 4.5, 20);
+    let mut findings = Vec::new();
+
+    for commit in &history.commits {
+        for line in &commit.added_lines {
+            findings.extend(scanner.scan_line(
+                &line.content,
+                &line.file_path,
+                line.line_number,
+                &commit.commit_id,
+                &commit.author,
+                &commit.date,
+            ));
+        }
+    }
+
+    findings
+}
+
+#[test]
+fn test_commit_range_scan() {
+    let Some(repo) = TempRepo::new("commit-range") else {
+        return;
+    };
+
+    repo.write("one.py", "API_KEY=8fA7b9Xq2WpZ0kL9mJ1vN3cR8tY6uIo5E\n");
+    repo.commit("first");
+    repo.write("two.py", "API_KEY=Zq3Wp8Rt5Yb2Nm9Kv4Xc7Ld1Fs6Gh0Jm3\n");
+    repo.commit("second");
+    repo.write("three.py", "API_KEY=Kx7Wm2Np9Qr4Tz6Bv1Yc3Ld8Hs5Jf0Gs2\n");
+    repo.commit("third");
+
+    let scope = CollectScope {
+        rev_range: Some("HEAD~1..HEAD".to_string()),
+        ..CollectScope::default()
+    };
+
+    let history = GitEngine::new(repo.path(), false, None, CollectLimits::default())
+        .with_scope(scope)
+        .collect_all_commits()
+        .expect("range collection must succeed");
+
+    assert_eq!(history.commits.len(), 1, "only the last commit must be scanned");
+
+    let files: Vec<String> = history
+        .commits
+        .iter()
+        .flat_map(|commit| commit.added_lines.iter().map(|line| line.file_path.clone()))
+        .collect();
+
+    assert!(files.iter().any(|file| file.contains("three.py")));
+    assert!(!files.iter().any(|file| file.contains("one.py") || file.contains("two.py")));
+}
+
+#[test]
+fn test_incremental_scan_uses_recorded_marker() {
+    let Some(repo) = TempRepo::new("incremental") else {
+        return;
+    };
+
+    repo.write("a.py", "value = 1\n");
+    repo.commit("first");
+
+    let state_path = std::env::temp_dir().join(format!(
+        "gsh-markers-{}-{}.json",
+        std::process::id(),
+        "incremental"
+    ));
+
+    let _ = std::fs::remove_file(&state_path);
+
+    let mut markers = ScanMarkers::at_path(state_path.clone());
+    record_head(repo.path(), &mut markers);
+
+    assert!(
+        markers.last_commit(repo.path()).is_some(),
+        "marker must be recorded"
+    );
+
+    repo.write(
+        "b.py",
+        &format!("OPENAI_API_KEY={}\n", openai_key()),
+    );
+    repo.commit("second");
+
+    let range = incremental_range(repo.path(), &markers).expect("range must be derived");
+    let scope = CollectScope {
+        rev_range: Some(range),
+        allow_empty: true,
+        ..CollectScope::default()
+    };
+
+    let history = GitEngine::new(repo.path(), false, None, CollectLimits::default())
+        .with_scope(scope)
+        .collect_all_commits()
+        .expect("incremental collection must succeed");
+
+    assert_eq!(history.commits.len(), 1, "only the new commit must be scanned");
+
+    let findings = scan_history(&history);
+
+    assert!(
+        findings.iter().any(|finding| finding.rule_id == "openai-api-key"),
+        "secret from the new commit must be detected"
+    );
+
+    record_head(repo.path(), &mut markers);
+
+    let scope = CollectScope {
+        rev_range: incremental_range(repo.path(), &markers),
+        allow_empty: true,
+        ..CollectScope::default()
+    };
+
+    let history = GitEngine::new(repo.path(), false, None, CollectLimits::default())
+        .with_scope(scope)
+        .collect_all_commits()
+        .expect("empty incremental range must not fail");
+
+    assert_eq!(history.commits.len(), 0, "no new commits means empty scan");
+
+    let _ = std::fs::remove_file(&state_path);
+}
+
+#[test]
+fn test_git_notes_are_scanned_when_requested() {
+    let Some(repo) = TempRepo::new("notes") else {
+        return;
+    };
+
+    repo.write("app.py", "value = 1\n");
+    repo.commit("base");
+
+    let note = format!("reviewer note: api_key={}", openai_key());
+    repo.git(&["notes", "add", "-m", &note]);
+
+    let scope = CollectScope {
+        include_notes: true,
+        ..CollectScope::default()
+    };
+
+    let history = GitEngine::new(repo.path(), false, None, CollectLimits::default())
+        .with_scope(scope)
+        .collect_all_commits()
+        .expect("notes collection must succeed");
+
+    assert!(
+        history
+            .commits
+            .iter()
+            .any(|commit| commit.commit_id.starts_with("notes:")),
+        "notes must be attached as a synthetic commit"
+    );
+
+    let findings = scan_history(&history);
+
+    assert!(
+        findings.iter().any(|finding| finding.rule_id == "openai-api-key"),
+        "secret stored in git notes must be detected"
+    );
+}
+
+#[test]
+fn test_lfs_objects_are_scanned_when_requested() {
+    let Some(repo) = TempRepo::new("lfs") else {
+        return;
+    };
+
+    repo.write("app.py", "value = 1\n");
+    repo.commit("base");
+
+    let lfs_dir = repo
+        .path()
+        .join(".git")
+        .join("lfs")
+        .join("objects")
+        .join("ab")
+        .join("cd");
+    std::fs::create_dir_all(&lfs_dir).expect("lfs dir must be created");
+
+    let payload = format!(
+        "\u{0}\u{1}binary prefix\naws_config: api_key = \"{}\"\nbinary suffix\u{2}\u{3}",
+        openai_key()
+    );
+
+    std::fs::write(
+        lfs_dir.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        payload,
+    )
+    .expect("lfs object must be written");
+
+    let scope = CollectScope {
+        include_lfs: true,
+        ..CollectScope::default()
+    };
+
+    let history = GitEngine::new(repo.path(), false, None, CollectLimits::default())
+        .with_scope(scope)
+        .collect_all_commits()
+        .expect("lfs collection must succeed");
+
+    assert!(
+        history
+            .commits
+            .iter()
+            .any(|commit| commit.commit_id == "LFS_OBJECTS"),
+        "lfs objects must be attached as a synthetic commit"
+    );
+
+    let findings = scan_history(&history);
+
+    assert!(
+        findings.iter().any(|finding| finding.rule_id == "openai-api-key"),
+        "secret stored inside a Git LFS object must be detected"
+    );
+}
+
+#[test]
+fn test_stash_and_tag_commits_are_scanned() {
+    let Some(repo) = TempRepo::new("stash-tag") else {
+        return;
+    };
+
+    repo.write("app.py", "value = 1\n");
+    repo.commit("base");
+
+    repo.write(
+        "t.py",
+        &format!("TAGGED_KEY={}\n", openai_key()),
+    );
+    repo.commit("tagged commit");
+    repo.git(&["tag", "v1.0"]);
+
+    repo.write("t.py", "value = 1\n");
+    repo.commit("remove secret");
+
+    repo.write(
+        "t.py",
+        &format!("STASHED_KEY={}\n", openai_key()),
+    );
+    repo.git(&["stash", "push", "-q", "-m", "wip"]);
+
+    let history = engine(repo.path(), false)
+        .collect_all_commits()
+        .expect("history collection must succeed");
+
+    let commit_messages: Vec<String> = history
+        .commits
+        .iter()
+        .map(|commit| commit.message.clone())
+        .collect();
+
+    assert!(
+        commit_messages.iter().any(|message| message.contains("tagged commit")),
+        "tagged commits must be included, got {:?}",
+        commit_messages
+    );
+
+    let findings = scan_history(&history);
+
+    assert!(
+        findings.iter().any(|finding| finding.rule_id == "openai-api-key"),
+        "secret stashed away must still be found in history"
+    );
 }

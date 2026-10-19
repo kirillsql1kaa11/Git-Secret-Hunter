@@ -1,9 +1,11 @@
-use super::github::{GitHubClient, GitHubRepo};
+use super::github::{CrawlFilters, GitHubClient, GitHubRepo};
 use super::runner::CrawlerRunner;
-use crate::scanner::{group_findings, Finding, FindingGroup, Scanner};
+use super::state::CrawlSeen;
+use crate::scanner::{Finding, FindingGroup, Scanner, group_findings};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -18,6 +20,10 @@ pub struct CrawlOptions {
     pub ai_only: bool,
     pub entropy_threshold: f64,
     pub min_entropy_len: usize,
+    pub filters: CrawlFilters,
+    pub skip_seen: bool,
+    pub remember_seen: bool,
+    pub verify: bool,
 }
 
 impl Default for CrawlOptions {
@@ -33,6 +39,10 @@ impl Default for CrawlOptions {
             ai_only: false,
             entropy_threshold: 4.5,
             min_entropy_len: 24,
+            filters: CrawlFilters::default(),
+            skip_seen: true,
+            remember_seen: true,
+            verify: false,
         }
     }
 }
@@ -43,6 +53,7 @@ pub struct CrawlTotals {
     pub scanned: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub skipped_known: usize,
     pub repos_with_leaks: usize,
     pub unique_findings: usize,
     pub failing_findings: usize,
@@ -70,10 +81,18 @@ impl CrawledRepo {
 }
 
 pub enum CrawlEvent {
-    Discovered { total: usize, query: Option<String> },
-    Started { repo_name: String },
+    Discovered {
+        total: usize,
+        query: Option<String>,
+        skipped_known: usize,
+    },
+    Started {
+        repo_name: String,
+    },
     Scanned(Box<CrawledRepo>),
-    Failed { repo_name: String },
+    Failed {
+        repo_name: String,
+    },
     Finished(Box<CrawlTotals>),
     Error(String),
 }
@@ -154,15 +173,16 @@ pub fn crawl_core(
         .map(|query| query.trim().to_string())
         .filter(|query| !query.is_empty());
 
-    let repos = match &query {
-        Some(query) => client.search_repos(query, options.limit)?,
-        None => client.fetch_random_repos(options.limit)?,
-    };
+    let mut seen = (options.skip_seen || options.remember_seen).then(CrawlSeen::load);
+    let exclude = seen.as_ref().map(CrawlSeen::as_set).unwrap_or_default();
 
-    let total = repos.len();
+    let discovery = client.discover(query.as_deref(), options.limit, &options.filters, &exclude)?;
+
+    let total = discovery.repos.len();
     on_event(CrawlEvent::Discovered {
         total,
         query: query.clone(),
+        skipped_known: discovery.skipped,
     });
 
     let scanner = Scanner::new(
@@ -170,8 +190,11 @@ pub fn crawl_core(
         true,
         options.entropy_threshold,
         options.min_entropy_len,
-    );
+    )
+    .with_verification(options.verify);
+
     let runner = CrawlerRunner::new(&scanner, options.depth, options.concurrency);
+    let recorded: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     let process = |repo: &GitHubRepo| -> RepoOutcome {
         if cancel.load(Ordering::Relaxed) {
@@ -182,7 +205,7 @@ pub fn crawl_core(
             repo_name: repo.full_name.clone(),
         });
 
-        match runner.scan_repo_detached(repo) {
+        let outcome = match runner.scan_repo_detached(repo) {
             Some(summary) => {
                 let groups = group_findings(&summary.findings);
                 let failing_findings = groups.iter().filter(|group| group.is_failing()).count();
@@ -205,24 +228,33 @@ pub fn crawl_core(
 
                 RepoOutcome::Failed
             }
+        };
+
+        if options.remember_seen {
+            if let Ok(mut recorded) = recorded.lock() {
+                recorded.push(repo.full_name.clone());
+            }
         }
+
+        outcome
     };
 
     let concurrency = options.concurrency.max(1);
     let outcomes: Vec<RepoOutcome> = if concurrency <= 1 || total <= 1 {
-        repos.iter().map(process).collect()
+        discovery.repos.iter().map(process).collect()
     } else {
         match rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency.min(total))
             .build()
         {
-            Ok(pool) => pool.install(|| repos.par_iter().map(process).collect()),
-            Err(_) => repos.iter().map(process).collect(),
+            Ok(pool) => pool.install(|| discovery.repos.par_iter().map(process).collect()),
+            Err(_) => discovery.repos.iter().map(process).collect(),
         }
     };
 
     let mut totals = CrawlTotals {
         discovered: total,
+        skipped_known: discovery.skipped,
         ..CrawlTotals::default()
     };
 
@@ -240,11 +272,38 @@ pub fn crawl_core(
         }
     }
 
+    if options.remember_seen {
+        let names = recorded
+            .lock()
+            .map(|recorded| recorded.clone())
+            .unwrap_or_default();
+
+        if !names.is_empty() {
+            let store = seen.get_or_insert_with(CrawlSeen::load);
+
+            for name in names {
+                store.record(&name);
+            }
+
+            store.save();
+        }
+    }
+
     totals.duration = started.elapsed();
 
     on_event(CrawlEvent::Finished(Box::new(totals.clone())));
 
     Ok(totals)
+}
+
+#[derive(Serialize)]
+pub struct CrawlFiltersReport {
+    pub min_stars: u32,
+    pub max_size_kb: Option<u64>,
+    pub language: Option<String>,
+    pub include_forks: bool,
+    pub include_archived: bool,
+    pub pushed_days: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -255,13 +314,17 @@ pub struct CrawlReport {
     pub query: Option<String>,
     pub depth: usize,
     pub concurrency: usize,
+    pub verify: bool,
+    pub filters: CrawlFiltersReport,
     pub discovered: usize,
     pub scanned: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub skipped_known: usize,
     pub repos_with_leaks: usize,
     pub unique_findings: usize,
     pub failing_findings: usize,
+    pub verified_findings: usize,
     pub duration_ms: u128,
     pub repos: Vec<CrawlRepoReport>,
 }
@@ -283,7 +346,7 @@ pub fn build_crawl_report(
     repos: &[CrawledRepo],
 ) -> CrawlReport {
     CrawlReport {
-        schema_version: 1,
+        schema_version: 2,
         tool_version: env!("CARGO_PKG_VERSION"),
         mode: "crawl",
         query: options
@@ -293,13 +356,35 @@ pub fn build_crawl_report(
             .filter(|query| !query.is_empty()),
         depth: options.depth,
         concurrency: options.concurrency,
+        verify: options.verify,
+        filters: CrawlFiltersReport {
+            min_stars: options.filters.min_stars,
+            max_size_kb: options.filters.max_size_kb,
+            language: options.filters.language.clone(),
+            include_forks: options.filters.include_forks,
+            include_archived: options.filters.include_archived,
+            pushed_days: options.filters.pushed_days,
+        },
         discovered: totals.discovered,
         scanned: totals.scanned,
         failed: totals.failed,
         skipped: totals.skipped,
+        skipped_known: totals.skipped_known,
         repos_with_leaks: totals.repos_with_leaks,
         unique_findings: repos.iter().map(|repo| repo.groups.len()).sum(),
         failing_findings: repos.iter().map(|repo| repo.failing_findings).sum(),
+        verified_findings: repos
+            .iter()
+            .flat_map(|repo| repo.groups.iter())
+            .filter(|group| {
+                use crate::verify::VerificationStatus;
+                group
+                    .verification
+                    .as_ref()
+                    .map(|verification| verification.status == VerificationStatus::Verified)
+                    .unwrap_or(false)
+            })
+            .count(),
         duration_ms: totals.duration.as_millis(),
         repos: repos
             .iter()

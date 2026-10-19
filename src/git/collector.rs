@@ -47,6 +47,17 @@ impl Default for CollectLimits {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CollectScope {
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub rev_range: Option<String>,
+    pub include_submodules: bool,
+    pub include_notes: bool,
+    pub include_lfs: bool,
+    pub allow_empty: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MergeDiffMode {
     FirstParent,
@@ -58,6 +69,7 @@ pub struct GitEngine {
     include_dangling: bool,
     max_commits: Option<usize>,
     limits: CollectLimits,
+    scope: CollectScope,
 }
 
 impl GitEngine {
@@ -72,7 +84,13 @@ impl GitEngine {
             include_dangling,
             max_commits,
             limits,
+            scope: CollectScope::default(),
         }
+    }
+
+    pub fn with_scope(mut self, scope: CollectScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     pub fn repo_path(&self) -> &Path {
@@ -184,16 +202,35 @@ impl GitEngine {
         self.ensure_repository()?;
 
         let merge_mode = self.detect_merge_mode();
-        let mut args: Vec<String> = vec![
-            "-c".into(),
-            "core.quotepath=false".into(),
-            "log".into(),
-            "--all".into(),
-            "--reflog".into(),
-            "--full-history".into(),
-            "--date=iso".into(),
-            "--format=COMMIT_META%x09%H%x09%an%x09%ad%x09%s".into(),
-        ];
+        let mut args: Vec<String> = vec!["-c".into(), "core.quotepath=false".into(), "log".into()];
+
+        if let Some(range) = &self.scope.rev_range {
+            if !range.trim().is_empty() {
+                args.push(range.clone());
+            } else {
+                args.push("--all".into());
+                args.push("--reflog".into());
+            }
+        } else {
+            args.push("--all".into());
+            args.push("--reflog".into());
+        }
+
+        args.push("--full-history".into());
+        args.push("--date=iso".into());
+        args.push("--format=COMMIT_META%x09%H%x09%an%x09%ad%x09%s".into());
+
+        if let Some(since) = &self.scope.since {
+            if !since.trim().is_empty() {
+                args.push(format!("--since={}", since.trim()));
+            }
+        }
+
+        if let Some(until) = &self.scope.until {
+            if !until.trim().is_empty() {
+                args.push(format!("--until={}", until.trim()));
+            }
+        }
 
         match merge_mode {
             MergeDiffMode::FirstParent => args.push("--diff-merges=first-parent".into()),
@@ -318,10 +355,61 @@ impl GitEngine {
             }
         }
 
+        if self.scope.include_submodules {
+            for (prefix, sub_path) in self.initialized_submodules() {
+                let mut sub_scope = self.scope.clone();
+                sub_scope.include_submodules = false;
+                sub_scope.rev_range = None;
+                sub_scope.allow_empty = true;
+
+                let sub_engine =
+                    GitEngine::new(&sub_path, false, self.max_commits, self.limits)
+                        .with_scope(sub_scope);
+
+                if let Ok(sub_history) = sub_engine.collect_all_commits() {
+                    skipped_lines += sub_history.skipped_lines;
+                    skipped_files += sub_history.skipped_files;
+
+                    for mut commit in sub_history.commits {
+                        for line in &mut commit.added_lines {
+                            line.file_path = format!("{}/{}", prefix, line.file_path);
+                        }
+                        commits.push(commit);
+                    }
+                }
+            }
+        }
+
+        if self.scope.include_notes {
+            commits.extend(self.collect_notes());
+        }
+
+        if self.scope.include_lfs {
+            commits.extend(self.collect_lfs_objects());
+        }
+
         if commits.is_empty() {
+            if self.scope.allow_empty {
+                return Ok(HistoryScan {
+                    commits,
+                    skipped_lines,
+                    skipped_files,
+                });
+            }
+
+            let reason = if self.scope.rev_range.is_some()
+                || self.scope.since.is_some()
+                || self.scope.until.is_some()
+            {
+                "no commits matched the requested range or date filter"
+            } else {
+                "contains no commits to scan (empty or unborn HEAD)"
+            };
+
             return Err(format!(
-                "repository '{}' contains no commits to scan (empty or unborn HEAD)",
-                self.repo_path.display()
+                "repository '{}' {}",
+                self.repo_path.display(),
+                reason
             ));
         }
 
@@ -330,6 +418,202 @@ impl GitEngine {
             skipped_lines,
             skipped_files,
         })
+    }
+
+    fn initialized_submodules(&self) -> Vec<(String, PathBuf)> {
+        let output = match self
+            .git()
+            .args(["submodule", "status", "--recursive"])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => return Vec::new(),
+        };
+
+        let mut submodules = Vec::new();
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let trimmed = line.trim_start();
+
+            if trimmed.starts_with('-') || trimmed.starts_with('U') {
+                continue;
+            }
+
+            let mut parts = trimmed.split_whitespace();
+            let _sha = parts.next();
+            let Some(path) = parts.next() else {
+                continue;
+            };
+
+            let full_path = self.repo_path.join(path);
+
+            if full_path.join(".git").exists() {
+                submodules.push((path.to_string(), full_path));
+            }
+        }
+
+        submodules
+    }
+
+    fn collect_notes(&self) -> Vec<GitCommitDiff> {
+        let refs_output = match self
+            .git()
+            .args(["for-each-ref", "--format=%(refname)", "refs/notes"])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => return Vec::new(),
+        };
+
+        let mut commits = Vec::new();
+
+        for reference in String::from_utf8_lossy(&refs_output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let tree_output = match self.git().args(["ls-tree", "-r", reference]).output() {
+                Ok(output) if output.status.success() => output,
+                _ => continue,
+            };
+
+            let mut added_lines = Vec::new();
+
+            for entry in String::from_utf8_lossy(&tree_output.stdout).lines() {
+                let Some((meta, path)) = entry.split_once('\t') else {
+                    continue;
+                };
+
+                let mut parts = meta.split_whitespace();
+                let (Some(_mode), Some(kind), Some(sha)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+
+                if kind != "blob" {
+                    continue;
+                }
+
+                let content = match self.git().args(["cat-file", "-p", sha]).output() {
+                    Ok(output) if output.status.success() => output,
+                    _ => continue,
+                };
+
+                if content.stdout.len() > self.limits.max_file_size {
+                    continue;
+                }
+
+                let text = String::from_utf8_lossy(&content.stdout);
+
+                if text.contains('\0') {
+                    continue;
+                }
+
+                for (offset, line) in text.lines().enumerate() {
+                    added_lines.push(DiffLine {
+                        file_path: format!(
+                            "{}:{}",
+                            reference.trim_start_matches("refs/notes/"),
+                            path
+                        ),
+                        line_number: offset + 1,
+                        content: self.cap_line(line),
+                    });
+                }
+            }
+
+            if !added_lines.is_empty() {
+                commits.push(GitCommitDiff {
+                    commit_id: format!("notes:{}", reference),
+                    author: "Git Notes".to_string(),
+                    date: "Git Notes".to_string(),
+                    message: String::new(),
+                    added_lines,
+                });
+            }
+        }
+
+        commits
+    }
+
+    fn collect_lfs_objects(&self) -> Vec<GitCommitDiff> {
+        let root = self.repo_path.join(".git").join("lfs").join("objects");
+
+        if !root.is_dir() {
+            return Vec::new();
+        }
+
+        let mut added_lines = Vec::new();
+        let mut stack = vec![root.clone()];
+        let mut files = 0;
+
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+
+                if files >= 5000 {
+                    break;
+                }
+
+                files += 1;
+
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+
+                if metadata.len() as usize > self.limits.max_file_size {
+                    continue;
+                }
+
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+
+                for (index, run) in printable_runs(&bytes, 16, 4000).into_iter().enumerate() {
+                    added_lines.push(DiffLine {
+                        file_path: format!("lfs:{}", relative),
+                        line_number: index + 1,
+                        content: self.cap_line(&run),
+                    });
+                }
+            }
+        }
+
+        if added_lines.is_empty() {
+            return Vec::new();
+        }
+
+        vec![GitCommitDiff {
+            commit_id: "LFS_OBJECTS".to_string(),
+            author: "Git LFS".to_string(),
+            date: "Local LFS objects".to_string(),
+            message: String::new(),
+            added_lines,
+        }]
+    }
+
+    fn cap_line(&self, line: &str) -> String {
+        if self.limits.max_line_len > 0 && line.len() > self.limits.max_line_len {
+            truncate_at_char_boundary(line, self.limits.max_line_len).to_string()
+        } else {
+            line.to_string()
+        }
     }
 
     fn find_dangling_commits(&self) -> Vec<String> {
@@ -540,6 +824,34 @@ fn truncate_at_char_boundary(input: &str, max: usize) -> &str {
     }
 
     &input[..end]
+}
+
+fn printable_runs(bytes: &[u8], min_len: usize, max_runs: usize) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+
+    for &byte in bytes {
+        if (0x20..=0x7e).contains(&byte) || byte == b'\t' {
+            current.push(byte);
+            continue;
+        }
+
+        if current.len() >= min_len {
+            runs.push(String::from_utf8_lossy(&current).to_string());
+
+            if runs.len() >= max_runs {
+                return runs;
+            }
+        }
+
+        current.clear();
+    }
+
+    if current.len() >= min_len && runs.len() < max_runs {
+        runs.push(String::from_utf8_lossy(&current).to_string());
+    }
+
+    runs
 }
 
 fn parse_diff_header(header: &str) -> Option<String> {

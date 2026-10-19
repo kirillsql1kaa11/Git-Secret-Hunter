@@ -1,13 +1,15 @@
 use clap::Parser;
+use colored::Colorize;
+use git_secret_hunter::audit;
 use git_secret_hunter::cli::{Cli, OutputFormat};
-use git_secret_hunter::crawler::{CrawlerRunner, GitHubClient};
-use git_secret_hunter::git::{CollectLimits, GitEngine};
+use git_secret_hunter::crawler::{CrawlFilters, CrawlerRunner, CrawlSeen, GitHubClient};
+use git_secret_hunter::git::{CollectLimits, CollectScope, GitEngine};
+use git_secret_hunter::incremental::{ScanMarkers, incremental_range, record_head};
 use git_secret_hunter::reporter;
-use git_secret_hunter::scanner::{group_findings, Finding, Scanner};
+use git_secret_hunter::scanner::{Scanner, group_findings};
 use git_secret_hunter::tui::launch_tui;
+use git_secret_hunter::verify::VerificationStatus;
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 fn main() {
@@ -19,7 +21,8 @@ fn main() {
         !args.no_entropy,
         args.entropy_threshold,
         args.min_entropy_len,
-    );
+    )
+    .with_verification(args.verify);
 
     if args.crawl {
         run_crawler(&args, &scanner);
@@ -31,12 +34,39 @@ fn main() {
         max_file_size: args.max_file_size,
     };
 
+    let mut scope = CollectScope {
+        since: args.since.clone(),
+        until: args.until.clone(),
+        rev_range: args.rev_range.clone(),
+        include_submodules: args.submodules,
+        include_notes: args.notes,
+        include_lfs: args.lfs,
+        allow_empty: false,
+    };
+
+    let mut markers = ScanMarkers::load();
+
+    if args.incremental && !args.staged && scope.rev_range.is_none() {
+        scope.rev_range = incremental_range(&args.path, &markers);
+        scope.allow_empty = true;
+
+        if args.format == OutputFormat::Text && !args.tui {
+            match &scope.rev_range {
+                Some(range) => println!("Incremental mode: scanning {}", range),
+                None => println!(
+                    "Incremental mode: no previous scan recorded for this repository, scanning full history"
+                ),
+            }
+        }
+    }
+
     let git_engine = GitEngine::new(
         &args.path,
         args.include_dangling,
         args.max_commits,
         limits,
-    );
+    )
+    .with_scope(scope);
 
     if args.format == OutputFormat::Text && !args.tui {
         reporter::console::print_banner();
@@ -61,7 +91,7 @@ fn main() {
     };
 
     let total_commits = history.commits.len();
-    let lines_counter = AtomicUsize::new(0);
+    let total_lines = history.total_lines();
 
     let progress_bar = if args.format == OutputFormat::Text && !args.tui {
         let bar = ProgressBar::new(total_commits as u64);
@@ -76,39 +106,21 @@ fn main() {
         None
     };
 
-    let findings: Vec<Finding> = history
-        .commits
-        .par_iter()
-        .flat_map(|commit| {
-            let mut commit_findings = Vec::new();
-            lines_counter.fetch_add(commit.added_lines.len(), Ordering::Relaxed);
-
-            for diff_line in &commit.added_lines {
-                let found = scanner.scan_line(
-                    &diff_line.content,
-                    &diff_line.file_path,
-                    diff_line.line_number,
-                    &commit.commit_id,
-                    &commit.author,
-                    &commit.date,
-                );
-                commit_findings.extend(found);
-            }
-
-            if let Some(ref bar) = progress_bar {
-                bar.inc(1);
-            }
-
-            commit_findings
-        })
-        .collect();
+    let findings = audit::scan_commits(&history.commits, &scanner, &|| {
+        if let Some(ref bar) = progress_bar {
+            bar.inc(1);
+        }
+    });
 
     if let Some(ref bar) = progress_bar {
         bar.finish_and_clear();
     }
 
+    if args.incremental && !args.staged {
+        record_head(&args.path, &mut markers);
+    }
+
     let duration = start_time.elapsed();
-    let total_lines = lines_counter.load(Ordering::Relaxed);
     let groups = group_findings(&findings);
     let failing = groups.iter().any(|group| group.is_failing());
 
@@ -129,6 +141,18 @@ fn main() {
                     history.skipped_files,
                     duration,
                 );
+
+                if args.verify {
+                    let verified = count_status(&groups, VerificationStatus::Verified);
+                    let invalid = count_status(&groups, VerificationStatus::Invalid);
+
+                    println!(
+                        "  {} {} live key(s), {} revoked/invalid",
+                        "Verification:".bright_black(),
+                        verified,
+                        invalid
+                    );
+                }
             }
             OutputFormat::Json => {
                 reporter::json::print_json(
@@ -150,6 +174,22 @@ fn main() {
     }
 }
 
+fn count_status(
+    groups: &[git_secret_hunter::scanner::FindingGroup],
+    status: VerificationStatus,
+) -> usize {
+    groups
+        .iter()
+        .filter(|group| {
+            group
+                .verification
+                .as_ref()
+                .map(|verification| verification.status == status)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
 fn run_crawler(args: &Cli, scanner: &Scanner) {
     if args.format == OutputFormat::Text && !args.tui {
         println!(
@@ -166,33 +206,56 @@ fn run_crawler(args: &Cli, scanner: &Scanner) {
         }
     };
 
-    let repos = if let Some(ref query) = args.query {
-        match gh_client.search_repos(query, args.crawl_limit) {
-            Ok(repos) => repos,
-            Err(e) => {
-                eprintln!("Error querying GitHub repositories: {}", e);
-                std::process::exit(2);
-            }
+    let mut filters = CrawlFilters::default();
+
+    if args.min_stars > 0 {
+        filters.min_stars = args.min_stars;
+    }
+
+    if let Some(megabytes) = args.max_size_mb {
+        filters.max_size_kb = (megabytes > 0).then(|| megabytes * 1024);
+    }
+
+    if let Some(language) = &args.language {
+        if !language.trim().is_empty() {
+            filters.language = Some(language.trim().to_string());
         }
-    } else {
-        match gh_client.fetch_random_repos(args.crawl_limit) {
-            Ok(repos) => repos,
-            Err(e) => {
-                eprintln!("Error fetching random GitHub repositories: {}", e);
-                std::process::exit(2);
-            }
+    }
+
+    filters.include_forks = args.include_forks;
+    filters.include_archived = args.include_archived;
+    filters.pushed_days = (args.pushed_days > 0).then_some(args.pushed_days);
+
+    let mut seen = (!args.no_crawl_dedupe).then(CrawlSeen::load);
+    let exclude = seen.as_ref().map(CrawlSeen::as_set).unwrap_or_default();
+
+    let discovery = match gh_client.discover(args.query.as_deref(), args.crawl_limit, &filters, &exclude)
+    {
+        Ok(discovery) => discovery,
+        Err(e) => {
+            eprintln!("Error discovering GitHub repositories: {}", e);
+            std::process::exit(2);
         }
     };
 
     if args.format == OutputFormat::Text && !args.tui {
         println!(
-            "Discovered {} candidate repositories. Starting mass audit...\n",
-            repos.len()
+            "Discovered {} candidate repositories ({} skipped as filtered out or already scanned).\n",
+            discovery.repos.len(),
+            discovery.skipped
         );
     }
 
     let runner = CrawlerRunner::new(scanner, args.crawl_depth, args.crawl_concurrency);
-    let stats = runner.run(&repos);
+    let stats = runner.run(&discovery.repos);
+
+    if let Some(store) = seen.as_mut() {
+        for repo in &discovery.repos {
+            store.record(&repo.full_name);
+        }
+
+        store.save();
+    }
 
     if args.tui {
         let mut all_findings = Vec::new();
@@ -205,7 +268,35 @@ fn run_crawler(args: &Cli, scanner: &Scanner) {
         }
     } else {
         match args.format {
-            OutputFormat::Text => stats.print_dashboard(),
+            OutputFormat::Text => {
+                stats.print_dashboard();
+
+                if args.verify {
+                    let mut verified = 0;
+
+                    for repo in &stats.repo_summaries {
+                        verified += repo
+                            .findings
+                            .iter()
+                            .filter(|finding| {
+                                finding
+                                    .verification
+                                    .as_ref()
+                                    .map(|verification| {
+                                        verification.status == VerificationStatus::Verified
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .count();
+                    }
+
+                    println!(
+                        "  {} {} live key(s) confirmed by providers",
+                        "Verification:".bright_black(),
+                        verified
+                    );
+                }
+            }
             OutputFormat::Json => {
                 if let Ok(json) = serde_json::to_string_pretty(&stats) {
                     println!("{}", json);

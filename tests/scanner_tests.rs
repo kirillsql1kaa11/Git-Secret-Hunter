@@ -320,3 +320,239 @@ fn test_artifact_names_are_not_secrets() {
         "dotted tokens containing a real secret must still be detected"
     );
 }
+
+fn scan_file(
+    scanner: &Scanner,
+    lines: &[&str],
+    path: &str,
+) -> Vec<git_secret_hunter::scanner::Finding> {
+    let numbered: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| (index + 1, *line))
+        .collect();
+
+    scanner.scan_file_lines(&numbered, path, "a1b2c3d4e5", "Developer", "2026-01-01 10:00:00 +0000")
+}
+
+#[test]
+fn test_multiline_yaml_block_secret() {
+    let lines = [
+        "service:",
+        "  password: |",
+        "    Gh7Kd3Qp9Wz2Lm5R",
+        "    t8Xy1Bv4Nc6Ej0Ai7",
+        "    Uo3Ps5Vd2Qf8Hk1Zr",
+    ];
+
+    let findings = scan_file(&scanner(), &lines, "config/deploy.yaml");
+
+    assert!(
+        findings.iter().any(|finding| finding.line_number == 3),
+        "secret split across YAML block scalar lines must be detected, got {:?}",
+        findings
+            .iter()
+            .map(|finding| (finding.rule_id.clone(), finding.line_number))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_multiline_toml_block_secret() {
+    let lines = [
+        "[service]",
+        "api_token = \"\"\"",
+        "Qw8Er9Ty2Ui4Op6As",
+        "Hj3Kl5Zx7Cv9Bn1Mm",
+        "\"\"\"",
+    ];
+
+    let findings = scan_file(&scanner(), &lines, "service/secrets.toml");
+
+    assert!(
+        findings.iter().any(|finding| finding.line_number == 3),
+        "secret inside a TOML multi-line string must be detected, got {:?}",
+        findings
+            .iter()
+            .map(|finding| (finding.rule_id.clone(), finding.line_number))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_pem_blocks_get_distinct_fingerprints() {
+    let lines = [
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "MIIEowIBAAKCAQEA7b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+        "MIIEowIBAAKCAQEA8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c",
+        "-----END RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "MHcCAQEEIN1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2",
+        "MHcCAQEEIN2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3",
+        "-----END EC PRIVATE KEY-----",
+    ];
+
+    let findings = scan_file(&scanner(), &lines, "certs/server.key");
+    let material: Vec<&git_secret_hunter::scanner::Finding> = findings
+        .iter()
+        .filter(|finding| finding.rule_id == "private-key-material")
+        .collect();
+
+    assert_eq!(
+        material.len(),
+        2,
+        "each PEM block must become one finding, got {:?}",
+        findings
+            .iter()
+            .map(|finding| finding.rule_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    assert_ne!(
+        material[0].fingerprint, material[1].fingerprint,
+        "different key bodies must not collapse into one fingerprint"
+    );
+
+    assert_eq!(material[0].line_number, 1);
+    assert_eq!(material[1].line_number, 5);
+
+    assert!(
+        !findings.iter().any(|finding| finding.rule_id == "private-key"),
+        "header-only findings must be replaced by full block findings"
+    );
+}
+
+#[test]
+fn test_checksum_manifest_lines_are_ignored() {
+    let scanner = scanner();
+    let manifest =
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08  release/app.tar.gz";
+
+    assert!(
+        scan_line(&scanner, manifest, "MANIFEST.sha256").is_empty(),
+        "sha256sum-style manifest lines must not be reported"
+    );
+
+    let assigned = "API_KEY: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    assert!(
+        !scan_line(&scanner, assigned, "app/config.py").is_empty(),
+        "a hex token assigned to a secret keyword must survive the checksum filter"
+    );
+}
+
+#[test]
+fn test_minified_bundles_skip_entropy_but_keep_rules() {
+    let scanner = scanner();
+    let pattern =
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk0Ll1Mm2Nn3Oo4Pp5Qq6Rr7Ss8Tt9Uu0Vv1Ww2Xx3Yy4Zz5";
+    let segment: String = pattern.repeat(3).chars().take(200).collect();
+    let mut bundle = String::new();
+
+    for index in 0..7 {
+        bundle.push_str(&format!("var v{}='{}';", index, segment));
+    }
+
+    assert!(bundle.len() > 1200, "bundle len={}", bundle.len());
+
+    let bundle_findings = scan_line(&scanner, &bundle, "static/bundle.js");
+
+    assert!(
+        bundle_findings
+            .iter()
+            .all(|finding| finding.rule_id != "high-entropy-token"),
+        "entropy search must be disabled inside minified single-line bundles"
+    );
+
+    let control = scan_line(&scanner, &segment, "static/app.js");
+
+    assert!(
+        control
+            .iter()
+            .any(|finding| finding.rule_id == "high-entropy-token"),
+        "the same value outside a minified line must still be detected"
+    );
+
+    let key_prefix = String::from("s") + "k-proj-";
+    let key_line = format!("{}uR8xL9pQ2mK5vN4wZ7tY1sA0bC3dE6fG8hI0jK2lM4nP6qS8", key_prefix);
+    let mut bundle_with_key = bundle.clone();
+    bundle_with_key.push_str(&format!("var k='{}';", key_line));
+
+    assert!(
+        scan_line(&scanner, &bundle_with_key, "static/bundle.js")
+            .iter()
+            .any(|finding| finding.rule_id == "openai-api-key"),
+        "provider rules must keep working inside minified bundles"
+    );
+}
+
+#[test]
+fn test_new_lockfiles_are_ignored() {
+    use git_secret_hunter::scanner::filters::is_ignored_path;
+
+    for path in [
+        "uv.lock",
+        "bun.lockb",
+        "flake.lock",
+        "mix.lock",
+        "gradle.lockfile",
+        ".terraform.lock.hcl",
+        "packages.lock.json",
+    ] {
+        assert!(is_ignored_path(path), "{} must be ignored", path);
+    }
+}
+
+#[test]
+fn test_pem_markers_in_source_code_are_not_key_material() {
+    let code = [
+        "if !header.contains(\"-----BEGIN \") || !header.contains(\"PRIVATE KEY\") {",
+        "    return None;",
+        "}",
+    ];
+
+    let findings = scan_file(&scanner(), &code, "src/pem.rs");
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.rule_id != "private-key-material"),
+        "source code mentioning PEM markers must not be treated as key material, got {:?}",
+        findings
+            .iter()
+            .map(|finding| finding.rule_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let unterminated = [
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "MIIEowIBAAKCAQEA7b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+    ];
+
+    let findings = scan_file(&scanner(), &unterminated, "certs/broken.key");
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.rule_id != "private-key-material"),
+        "a PEM block without an END marker must not produce key material"
+    );
+}
+
+#[test]
+fn test_verification_mode_captures_raw_secrets() {
+    let capturing = Scanner::new(false, true, 4.5, 20).with_verification(true);
+    let prefix = String::from("s") + "k-proj-";
+    let line = format!("OPENAI_API_KEY={}uR8xL9pQ2mK5vN4wZ7tY1sA0bC3dE6fG8hI0jK2lM4nP6qS8", prefix);
+
+    let findings = scan_line(&capturing, &line, ".env");
+
+    assert!(findings.iter().any(|finding| finding.secret.is_some()));
+
+    let plain = scan_line(&scanner(), &line, ".env");
+
+    assert!(
+        plain.iter().all(|finding| finding.secret.is_none()),
+        "raw secrets must only be kept in memory when verification is enabled"
+    );
+}

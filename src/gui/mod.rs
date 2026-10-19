@@ -6,6 +6,7 @@ use crate::crawler::{
 };
 use crate::scanner::{FindingGroup, Severity};
 use crate::tui::state::ResolvedState;
+use crate::verify::VerificationStatus;
 use eframe::egui;
 use scan::{ScanHandle, ScanOptions, ScanOutcome, ScanResult, spawn_scan};
 use std::path::PathBuf;
@@ -45,6 +46,11 @@ pub struct GuiApp {
     crawl_error: Option<String>,
     crawl_only_leaks: bool,
     crawl_filter: String,
+    crawl_skipped_known: usize,
+    crawl_language: String,
+    range_input: String,
+    since_input: String,
+    until_input: String,
     selected_repo: Option<usize>,
     selected_crawl_group: Option<usize>,
 }
@@ -64,6 +70,11 @@ impl GuiApp {
         let crawl_options = CrawlOptions::default();
         let crawl_token = crawl_options.token.clone().unwrap_or_default();
         let crawl_query = crawl_options.query.clone().unwrap_or_default();
+        let crawl_language = crawl_options
+            .filters
+            .language
+            .clone()
+            .unwrap_or_default();
 
         Self {
             mode: GuiMode::Crawler,
@@ -91,6 +102,11 @@ impl GuiApp {
             crawl_error: None,
             crawl_only_leaks: true,
             crawl_filter: String::new(),
+            crawl_skipped_known: 0,
+            crawl_language,
+            range_input: String::new(),
+            since_input: String::new(),
+            until_input: String::new(),
             selected_repo: None,
             selected_crawl_group: None,
         }
@@ -128,8 +144,13 @@ impl GuiApp {
 
         while let Some(event) = self.crawl.as_ref().and_then(|handle| handle.poll()) {
             match event {
-                CrawlEvent::Discovered { total, .. } => {
+                CrawlEvent::Discovered {
+                    total,
+                    skipped_known,
+                    ..
+                } => {
                     self.crawl_total = total;
+                    self.crawl_skipped_known = skipped_known;
                 }
                 CrawlEvent::Started { repo_name } => {
                     self.crawl_active.push(repo_name);
@@ -186,6 +207,10 @@ impl GuiApp {
         self.crawl_options.depth = self.crawl_options.depth.clamp(1, 5000);
         self.crawl_options.concurrency = self.crawl_options.concurrency.clamp(1, 32);
         self.crawl_options.query = Some(self.crawl_query.trim().to_string());
+        self.crawl_options.filters.language = {
+            let language = self.crawl_language.trim().to_string();
+            (!language.is_empty()).then_some(language)
+        };
         self.crawl_options.token = {
             let token = self.crawl_token.trim().to_string();
             if token.is_empty() {
@@ -201,6 +226,7 @@ impl GuiApp {
         self.crawl_active.clear();
         self.crawl_failed = 0;
         self.crawl_total = 0;
+        self.crawl_skipped_known = 0;
         self.crawl_totals = None;
         self.crawl_error = None;
         self.crawl_cancelled = false;
@@ -239,6 +265,18 @@ impl GuiApp {
         }
 
         self.options.path = path;
+        self.options.rev_range = {
+            let value = self.range_input.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        self.options.since = {
+            let value = self.since_input.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        self.options.until = {
+            let value = self.until_input.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
         self.result = None;
         self.error = None;
         self.export_status = None;
@@ -503,6 +541,88 @@ impl GuiApp {
                 );
             }
         });
+
+        ui.add_space(3.0);
+
+        egui::CollapsingHeader::new("Фильтры выборки и проверка ключей")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("crawl-filters")
+                    .num_columns(2)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Язык:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.crawl_language)
+                                .desired_width(140.0)
+                                .hint_text("python"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Минимум звёзд:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.crawl_options.filters.min_stars)
+                                .range(0..=100_000),
+                        );
+                        ui.end_row();
+
+                        ui.label("Максимальный размер:");
+                        ui.horizontal(|ui| {
+                            let mut limited = self.crawl_options.filters.max_size_kb.is_some();
+
+                            if ui.checkbox(&mut limited, "ограничить").changed() {
+                                self.crawl_options.filters.max_size_kb =
+                                    limited.then_some(500 * 1024);
+                            }
+
+                            let mut megabytes = self.crawl_options.filters.max_size_kb.unwrap_or(500 * 1024) / 1024;
+
+                            if ui
+                                .add_enabled(
+                                    limited,
+                                    egui::DragValue::new(&mut megabytes)
+                                        .range(1..=100_000)
+                                        .suffix(" MB"),
+                                )
+                                .changed()
+                            {
+                                self.crawl_options.filters.max_size_kb = Some(megabytes * 1024);
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Не старше (дней):");
+                        {
+                            let mut pushed = self.crawl_options.filters.pushed_days.unwrap_or(0);
+
+                            if ui
+                                .add(egui::DragValue::new(&mut pushed).range(0..=3650))
+                                .changed()
+                            {
+                                self.crawl_options.filters.pushed_days =
+                                    (pushed > 0).then_some(pushed);
+                            }
+                        }
+                        ui.end_row();
+
+                        ui.label("Прочее:");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.crawl_options.filters.include_forks, "форки");
+                            ui.checkbox(&mut self.crawl_options.filters.include_archived, "архивные");
+                            ui.checkbox(&mut self.crawl_options.skip_seen, "не повторять просканированные");
+                            ui.checkbox(&mut self.crawl_options.verify, "проверять ключи онлайн");
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Фильтры применяются и к случайной выборке, и к поисковому запросу. Проверка ключей отправляет найденные токены в API провайдеров — включайте осознанно.",
+                    )
+                    .color(egui::Color32::from_gray(150)),
+                );
+            });
     }
 
     fn toolbar_repository(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -571,6 +691,48 @@ impl GuiApp {
             ui.label("Мин. длина:");
             ui.add(egui::Slider::new(&mut self.options.min_entropy_len, 8..=64));
         });
+
+        ui.add_space(2.0);
+
+        egui::CollapsingHeader::new("Дополнительно: проверка, субмодули, notes, LFS, диапазон")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.options.verify, "Проверять ключи онлайн");
+                    ui.checkbox(&mut self.options.include_submodules, "Субмодули");
+                    ui.checkbox(&mut self.options.include_notes, "Git notes");
+                    ui.checkbox(&mut self.options.include_lfs, "Git LFS");
+                    ui.checkbox(&mut self.options.incremental, "Только новые коммиты");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Диапазон:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.range_input)
+                            .desired_width(150.0)
+                            .hint_text("HEAD~50..HEAD"),
+                    );
+                    ui.label("С даты:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.since_input)
+                            .desired_width(110.0)
+                            .hint_text("2026-01-01"),
+                    );
+                    ui.label("По дату:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.until_input)
+                            .desired_width(110.0)
+                            .hint_text("2026-12-31"),
+                    );
+                });
+
+                ui.label(
+                    egui::RichText::new(
+                        "Проверка ключей отправляет найденные токены в API провайдеров. «Только новые коммиты» использует отметку прошлого скана этого репозитория; диапазон и даты задаются явно.",
+                    )
+                    .color(egui::Color32::from_gray(150)),
+                );
+            });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -613,8 +775,8 @@ impl GuiApp {
                             ui.label(format!("Устранено: {}", resolved));
                             ui.separator();
                             ui.label(format!(
-                                "Ошибок: {}, пропущено: {}",
-                                totals.failed, totals.skipped
+                                "Ошибок: {}, пропущено: {} (уже видели: {})",
+                                totals.failed, totals.skipped, self.crawl_skipped_known
                             ));
                         } else {
                             ui.label("Укажите параметры и нажмите «Запустить краулинг».");
@@ -1037,8 +1199,15 @@ fn group_row_text(group: &FindingGroup) -> String {
         .map(|occurrence| occurrence.file_path.clone())
         .unwrap_or_default();
 
+    let badge = match group.verification.as_ref().map(|verification| verification.status) {
+        Some(VerificationStatus::Verified) => "✔ ",
+        Some(VerificationStatus::Invalid) => "✖ ",
+        _ => "",
+    };
+
     let mut line = format!(
-        "[{}] {}  ({})",
+        "{}[{}] {}  ({})",
+        badge,
         group.severity.label(),
         group.rule_name,
         location
@@ -1062,12 +1231,31 @@ fn repo_row_text(repo: &CrawledRepo, resolved: &ResolvedState) -> String {
         .filter(|group| resolved.is_resolved(&group.fingerprint))
         .count();
 
+    let verified = repo
+        .groups
+        .iter()
+        .filter(|group| {
+            group
+                .verification
+                .as_ref()
+                .map(|verification| verification.status == VerificationStatus::Verified)
+                .unwrap_or(false)
+        })
+        .count();
+
+    let badge = if verified > 0 { "✔ " } else { "" };
+
     let mut text = format!(
-        "{}  · {} находок ({} блокирующих)",
+        "{}{}  · {} находок ({} блокирующих)",
+        badge,
         repo.repo_name,
         repo.groups.len(),
         repo.failing_findings
     );
+
+    if verified > 0 {
+        text.push_str(&format!(", подтверждено {}", verified));
+    }
 
     if resolved_count > 0 {
         text.push_str(&format!(", устранено {}", resolved_count));
@@ -1161,6 +1349,20 @@ fn render_group_details(
                 ui.colored_label(egui::Color32::from_rgb(255, 150, 150), "активный риск");
             }
             ui.end_row();
+
+            ui.label("Проверка ключа:");
+            match group.verification.as_ref() {
+                Some(verification) => {
+                    ui.colored_label(
+                        verification_color(verification.status),
+                        format!("{} ({})", verification.label(), verification.detail),
+                    );
+                }
+                None => {
+                    ui.label("не выполнялась");
+                }
+            }
+            ui.end_row();
         });
 
     ui.separator();
@@ -1219,6 +1421,15 @@ fn severity_color(severity: Severity) -> egui::Color32 {
         Severity::Medium => egui::Color32::from_rgb(120, 170, 255),
         Severity::Low => egui::Color32::from_gray(160),
         Severity::Info => egui::Color32::from_rgb(120, 210, 220),
+    }
+}
+
+fn verification_color(status: VerificationStatus) -> egui::Color32 {
+    match status {
+        VerificationStatus::Verified => egui::Color32::from_rgb(120, 220, 140),
+        VerificationStatus::Invalid => egui::Color32::from_gray(150),
+        VerificationStatus::Unknown => egui::Color32::from_rgb(230, 190, 90),
+        VerificationStatus::Error => egui::Color32::from_rgb(230, 120, 120),
     }
 }
 
