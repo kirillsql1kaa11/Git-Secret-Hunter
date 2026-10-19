@@ -289,3 +289,34 @@ fn test_candidate_families() {
     let repeated = analyze_candidate("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 4.5, false);
     assert!(repeated.is_none());
 }
+
+#[test]
+fn test_artifact_names_are_not_secrets() {
+    let scanner = scanner();
+
+    let workflow_line =
+        "Compress-Archive -Path \"git-secret-hunter-$env:GITHUB_REF_NAME-windows-x64.zip\"";
+    assert!(
+        scan_line(&scanner, workflow_line, ".github/workflows/release.yml").is_empty(),
+        "artifact file names must not be reported as secrets"
+    );
+
+    let bundle_line = "const bundle = \"vendor.min.js\"; const token = bundle;";
+    assert!(
+        scan_line(&scanner, bundle_line, "web/app.js").is_empty(),
+        "minified bundle names must not be reported as secrets"
+    );
+
+    let version_line = "download_url = \"release-tool-1.2.3\"";
+    assert!(
+        scan_line(&scanner, version_line, "build/package.py").is_empty(),
+        "version-like names must not be reported as secrets"
+    );
+
+    let secret_line =
+        "service_token=Gh7Kd3Qp9Wz2Lm5Rt8Xy1Bv4Nc6Ej0Ai7Uo3Ps5Vd2Qf8Hk1Zr4.internal";
+    assert!(
+        !scan_line(&scanner, secret_line, "config/settings.py").is_empty(),
+        "dotted tokens containing a real secret must still be detected"
+    );
+}

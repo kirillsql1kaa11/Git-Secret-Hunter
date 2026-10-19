@@ -1,6 +1,10 @@
 pub mod scan;
 
-use crate::scanner::Severity;
+use crate::crawler::{
+    CrawlEvent, CrawlHandle, CrawlOptions, CrawlTotals, CrawledRepo, crawl_report_json,
+    spawn_crawl,
+};
+use crate::scanner::{FindingGroup, Severity};
 use crate::tui::state::ResolvedState;
 use eframe::egui;
 use scan::{ScanHandle, ScanOptions, ScanOutcome, ScanResult, spawn_scan};
@@ -9,7 +13,14 @@ use std::path::PathBuf;
 const MAX_LIST_TEXT: usize = 72;
 const MAX_OCCURRENCES_SHOWN: usize = 200;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiMode {
+    Crawler,
+    Repository,
+}
+
 pub struct GuiApp {
+    mode: GuiMode,
     options: ScanOptions,
     path_input: String,
     pending: Option<ScanHandle>,
@@ -21,6 +32,21 @@ pub struct GuiApp {
     selected: Option<usize>,
     resolved: ResolvedState,
     export_status: Option<String>,
+    crawl_options: CrawlOptions,
+    crawl_query: String,
+    crawl_token: String,
+    crawl: Option<CrawlHandle>,
+    crawl_total: usize,
+    crawl_repos: Vec<CrawledRepo>,
+    crawl_active: Vec<String>,
+    crawl_failed: usize,
+    crawl_totals: Option<CrawlTotals>,
+    crawl_cancelled: bool,
+    crawl_error: Option<String>,
+    crawl_only_leaks: bool,
+    crawl_filter: String,
+    selected_repo: Option<usize>,
+    selected_crawl_group: Option<usize>,
 }
 
 impl GuiApp {
@@ -35,7 +61,12 @@ impl GuiApp {
 
         creation.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        let crawl_options = CrawlOptions::default();
+        let crawl_token = crawl_options.token.clone().unwrap_or_default();
+        let crawl_query = crawl_options.query.clone().unwrap_or_default();
+
         Self {
+            mode: GuiMode::Crawler,
             path_input: options.path.display().to_string(),
             options,
             pending: None,
@@ -47,15 +78,32 @@ impl GuiApp {
             selected: None,
             resolved: ResolvedState::load(),
             export_status: None,
+            crawl_options,
+            crawl_query,
+            crawl_token,
+            crawl: None,
+            crawl_total: 0,
+            crawl_repos: Vec::new(),
+            crawl_active: Vec::new(),
+            crawl_failed: 0,
+            crawl_totals: None,
+            crawl_cancelled: false,
+            crawl_error: None,
+            crawl_only_leaks: true,
+            crawl_filter: String::new(),
+            selected_repo: None,
+            selected_crawl_group: None,
         }
     }
 
     fn poll_scan(&mut self, ctx: &egui::Context) {
-        let Some(handle) = &self.pending else {
+        if self.pending.is_none() {
             return;
-        };
+        }
 
-        match handle.poll() {
+        let event = self.pending.as_ref().and_then(|handle| handle.poll());
+
+        match event {
             Some(ScanOutcome::Done(result)) => {
                 self.selected = if result.groups.is_empty() { None } else { Some(0) };
                 self.result = Some(*result);
@@ -68,6 +116,108 @@ impl GuiApp {
                 self.pending = None;
             }
             None => ctx.request_repaint(),
+        }
+    }
+
+    fn poll_crawl(&mut self, ctx: &egui::Context) {
+        if self.crawl.is_none() {
+            return;
+        }
+
+        let mut finished = false;
+
+        while let Some(event) = self.crawl.as_ref().and_then(|handle| handle.poll()) {
+            match event {
+                CrawlEvent::Discovered { total, .. } => {
+                    self.crawl_total = total;
+                }
+                CrawlEvent::Started { repo_name } => {
+                    self.crawl_active.push(repo_name);
+                }
+                CrawlEvent::Scanned(repo) => {
+                    self.crawl_active.retain(|name| name != &repo.repo_name);
+                    self.crawl_repos.push(*repo);
+                }
+                CrawlEvent::Failed { repo_name } => {
+                    self.crawl_active.retain(|name| name != &repo_name);
+                    self.crawl_failed += 1;
+                }
+                CrawlEvent::Finished(totals) => {
+                    self.crawl_active.clear();
+                    self.crawl_total = totals.discovered;
+                    self.crawl_repos.sort_by(|left, right| {
+                        right
+                            .failing_findings
+                            .cmp(&left.failing_findings)
+                            .then(right.groups.len().cmp(&left.groups.len()))
+                            .then(left.repo_name.cmp(&right.repo_name))
+                    });
+                    self.selected_repo = self
+                        .crawl_repos
+                        .iter()
+                        .position(|repo| !repo.groups.is_empty());
+                    self.selected_crawl_group = Some(0);
+                    self.crawl_totals = Some(*totals);
+                    self.crawl = None;
+                    finished = true;
+                    break;
+                }
+                CrawlEvent::Error(error) => {
+                    self.crawl_active.clear();
+                    self.crawl_error = Some(error);
+                    self.crawl = None;
+                    finished = true;
+                    break;
+                }
+            }
+        }
+
+        if !finished && self.crawl.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn start_crawl(&mut self, ctx: &egui::Context) {
+        if self.crawl.is_some() {
+            return;
+        }
+
+        self.crawl_options.limit = self.crawl_options.limit.clamp(1, 500);
+        self.crawl_options.depth = self.crawl_options.depth.clamp(1, 5000);
+        self.crawl_options.concurrency = self.crawl_options.concurrency.clamp(1, 32);
+        self.crawl_options.query = Some(self.crawl_query.trim().to_string());
+        self.crawl_options.token = {
+            let token = self.crawl_token.trim().to_string();
+            if token.is_empty() {
+                std::env::var("GITHUB_TOKEN")
+                    .ok()
+                    .filter(|token| !token.trim().is_empty())
+            } else {
+                Some(token)
+            }
+        };
+
+        self.crawl_repos.clear();
+        self.crawl_active.clear();
+        self.crawl_failed = 0;
+        self.crawl_total = 0;
+        self.crawl_totals = None;
+        self.crawl_error = None;
+        self.crawl_cancelled = false;
+        self.selected_repo = None;
+        self.selected_crawl_group = None;
+        self.export_status = None;
+
+        let notify_ctx = ctx.clone();
+        self.crawl = Some(spawn_crawl(self.crawl_options.clone(), move || {
+            notify_ctx.request_repaint();
+        }));
+    }
+
+    fn stop_crawl(&mut self) {
+        if let Some(handle) = &self.crawl {
+            handle.cancel();
+            self.crawl_cancelled = true;
         }
     }
 
@@ -101,11 +251,24 @@ impl GuiApp {
     }
 
     fn export_json(&mut self) {
-        let Some(result) = &self.result else {
-            return;
+        let payload = match self.mode {
+            GuiMode::Repository => match &self.result {
+                Some(result) => result.to_json(),
+                None => return,
+            },
+            GuiMode::Crawler => match &self.crawl_totals {
+                Some(totals) => crawl_report_json(&self.crawl_options, totals, &self.crawl_repos),
+                None => return,
+            },
         };
 
-        let default_name = format!("secret-hunter-report-{}s.json", result.duration.as_secs());
+        let default_name = match self.mode {
+            GuiMode::Repository => "secret-hunter-report.json".to_string(),
+            GuiMode::Crawler => format!(
+                "secret-hunter-crawl-{}.json",
+                self.crawl_repos.len()
+            ),
+        };
 
         let Some(target) = rfd::FileDialog::new()
             .set_file_name(default_name)
@@ -115,13 +278,13 @@ impl GuiApp {
             return;
         };
 
-        match std::fs::write(&target, result.to_json()) {
+        match std::fs::write(&target, payload) {
             Ok(()) => self.export_status = Some(format!("Отчёт сохранён: {}", target.display())),
             Err(error) => self.export_status = Some(format!("Ошибка записи: {}", error)),
         }
     }
 
-    fn visible_indices(&self) -> Vec<usize> {
+    fn visible_scan_indices(&self) -> Vec<usize> {
         let Some(result) = &self.result else {
             return Vec::new();
         };
@@ -156,11 +319,25 @@ impl GuiApp {
             .collect()
     }
 
+    fn visible_crawl_indices(&self) -> Vec<usize> {
+        let filter = self.crawl_filter.trim().to_lowercase();
+
+        self.crawl_repos
+            .iter()
+            .enumerate()
+            .filter(|(_, repo)| !self.crawl_only_leaks || !repo.groups.is_empty())
+            .filter(|(_, repo)| {
+                filter.is_empty() || repo.repo_name.to_lowercase().contains(&filter)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("Git Secret Hunter");
                 ui.label(
                     egui::RichText::new("GUI")
@@ -169,73 +346,27 @@ impl GuiApp {
                 );
                 ui.separator();
 
-                if ui.button("Открыть репозиторий…").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        self.path_input = folder.display().to_string();
-                    }
-                }
-
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.path_input)
-                        .desired_width(360.0)
-                        .hint_text("Путь к git-репозиторию"),
+                ui.selectable_value(
+                    &mut self.mode,
+                    GuiMode::Crawler,
+                    "Краулер случайных репозиториев",
                 );
-
-                let scanning = self.pending.is_some();
-
-                if ui
-                    .add_enabled(!scanning, egui::Button::new("Сканировать"))
-                    .clicked()
-                {
-                    self.start_scan(ctx);
-                }
-
-                if ui
-                    .add_enabled(
-                        self.result.is_some() && !scanning,
-                        egui::Button::new("Экспорт JSON…"),
-                    )
-                    .clicked()
-                {
-                    self.export_json();
-                }
-
-                if let Some(handle) = &self.pending {
-                    ui.add(
-                        egui::ProgressBar::new(handle.fraction())
-                            .desired_width(170.0)
-                            .show_percentage(),
-                    );
-                    ui.label(format!(
-                        "{}/{} коммитов, {:.1}s",
-                        handle.scanned_commits(),
-                        handle.total_commits(),
-                        handle.started.elapsed().as_secs_f32()
-                    ));
-                }
+                ui.selectable_value(&mut self.mode, GuiMode::Repository, "Локальный репозиторий");
             });
 
             ui.add_space(4.0);
 
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.options.ai_only, "Только AI-ключи");
-                ui.checkbox(&mut self.options.check_entropy, "Энтропийный поиск");
-                ui.checkbox(&mut self.options.include_dangling, "Включая dangling");
-                ui.checkbox(&mut self.options.staged, "Только staged (pre-commit)");
-
-                ui.separator();
-                ui.label("Порог энтропии:");
-                ui.add(
-                    egui::Slider::new(&mut self.options.entropy_threshold, 2.0..=6.5)
-                        .fixed_decimals(1),
-                );
-
-                ui.separator();
-                ui.label("Мин. длина:");
-                ui.add(egui::Slider::new(&mut self.options.min_entropy_len, 8..=64));
-            });
+            match self.mode {
+                GuiMode::Crawler => self.toolbar_crawler(ui, ctx),
+                GuiMode::Repository => self.toolbar_repository(ui, ctx),
+            }
 
             if let Some(error) = &self.error {
+                ui.add_space(2.0);
+                ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error.clone());
+            }
+
+            if let Some(error) = &self.crawl_error {
                 ui.add_space(2.0);
                 ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error.clone());
             }
@@ -244,49 +375,292 @@ impl GuiApp {
         });
     }
 
+    fn toolbar_crawler(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let running = self.crawl.is_some();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Запрос:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.crawl_query)
+                    .desired_width(230.0)
+                    .hint_text("пусто = случайные репозитории"),
+            );
+
+            ui.separator();
+            ui.label("Репозиториев:");
+            ui.add(
+                egui::DragValue::new(&mut self.crawl_options.limit)
+                    .range(1..=500)
+                    .speed(1.0),
+            );
+
+            ui.label("Глубина (коммитов):");
+            ui.add(
+                egui::DragValue::new(&mut self.crawl_options.depth)
+                    .range(1..=5000)
+                    .speed(5.0),
+            );
+
+            ui.label("Потоков:");
+            ui.add(
+                egui::DragValue::new(&mut self.crawl_options.concurrency)
+                    .range(1..=32)
+                    .speed(1.0),
+            );
+
+            ui.separator();
+            ui.checkbox(&mut self.crawl_options.ai_only, "Только AI-ключи");
+            ui.checkbox(&mut self.crawl_only_leaks, "Показывать только с находками");
+
+            ui.separator();
+
+            if ui
+                .add_enabled(!running, egui::Button::new("Запустить краулинг"))
+                .clicked()
+            {
+                self.start_crawl(ctx);
+            }
+
+            if ui
+                .add_enabled(running, egui::Button::new("Остановить"))
+                .clicked()
+            {
+                self.stop_crawl();
+            }
+
+            if ui
+                .add_enabled(
+                    self.crawl_totals.is_some() && !running,
+                    egui::Button::new("Экспорт JSON…"),
+                )
+                .clicked()
+            {
+                self.export_json();
+            }
+        });
+
+        ui.add_space(3.0);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("GitHub-токен:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.crawl_token)
+                    .desired_width(260.0)
+                    .hint_text("необязательно, повышает лимиты API"),
+            );
+
+            ui.separator();
+
+            if running {
+                ui.spinner();
+
+                let done = self.crawl_repos.len() + self.crawl_failed;
+                let total = self.crawl_total.max(1);
+                let fraction = (done as f32 / total as f32).clamp(0.0, 1.0);
+
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(200.0)
+                        .show_percentage(),
+                );
+
+                let elapsed = self
+                    .crawl
+                    .as_ref()
+                    .map(|handle| handle.started.elapsed().as_secs_f32())
+                    .unwrap_or_default();
+
+                ui.label(format!("{}/{} репозиториев, {:.0}s", done, total, elapsed));
+
+                if self.crawl_cancelled {
+                    ui.colored_label(egui::Color32::from_rgb(230, 190, 90), "останавливаю…");
+                } else if !self.crawl_active.is_empty() {
+                    let active = self
+                        .crawl_active
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ui.label(format!("сейчас: {}", active));
+                }
+            } else if let Some(totals) = &self.crawl_totals {
+                ui.label(format!(
+                    "Просканировано {} из {} (ошибок {}, пропущено {}), находок в {} репозиториях, время {:.1}s",
+                    totals.scanned,
+                    totals.discovered,
+                    totals.failed,
+                    totals.skipped,
+                    totals.repos_with_leaks,
+                    totals.duration.as_secs_f32()
+                ));
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "Случайные репозитории GitHub сканируются параллельно; результаты появляются по мере готовности.",
+                    )
+                    .color(egui::Color32::from_gray(150)),
+                );
+            }
+        });
+    }
+
+    fn toolbar_repository(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if ui.button("Открыть репозиторий…").clicked() {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.path_input = folder.display().to_string();
+                }
+            }
+
+            ui.add(
+                egui::TextEdit::singleline(&mut self.path_input)
+                    .desired_width(320.0)
+                    .hint_text("Путь к git-репозиторию"),
+            );
+
+            let scanning = self.pending.is_some();
+
+            if ui
+                .add_enabled(!scanning, egui::Button::new("Сканировать"))
+                .clicked()
+            {
+                self.start_scan(ctx);
+            }
+
+            if ui
+                .add_enabled(
+                    self.result.is_some() && !scanning,
+                    egui::Button::new("Экспорт JSON…"),
+                )
+                .clicked()
+            {
+                self.export_json();
+            }
+
+            if let Some(handle) = &self.pending {
+                ui.add(
+                    egui::ProgressBar::new(handle.fraction())
+                        .desired_width(170.0)
+                        .show_percentage(),
+                );
+                ui.label(format!(
+                    "{}/{} коммитов, {:.1}s",
+                    handle.scanned_commits(),
+                    handle.total_commits(),
+                    handle.started.elapsed().as_secs_f32()
+                ));
+            }
+        });
+
+        ui.add_space(4.0);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.options.ai_only, "Только AI-ключи");
+            ui.checkbox(&mut self.options.check_entropy, "Энтропийный поиск");
+            ui.checkbox(&mut self.options.include_dangling, "Включая dangling");
+            ui.checkbox(&mut self.options.staged, "Только staged (pre-commit)");
+
+            ui.separator();
+            ui.label("Порог энтропии:");
+            ui.add(
+                egui::Slider::new(&mut self.options.entropy_threshold, 2.0..=6.5).fixed_decimals(1),
+            );
+
+            ui.separator();
+            ui.label("Мин. длина:");
+            ui.add(egui::Slider::new(&mut self.options.min_entropy_len, 8..=64));
+        });
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
 
             ui.horizontal_wrapped(|ui| {
-                let Some(result) = &self.result else {
-                    ui.label("Укажите путь к репозиторию и нажмите «Сканировать».");
-                    return;
-                };
+                match self.mode {
+                    GuiMode::Crawler => {
+                        if let Some(totals) = &self.crawl_totals {
+                            let leaks = self.crawl_repos.iter().filter(|r| !r.groups.is_empty()).count();
+                            let unique: usize =
+                                self.crawl_repos.iter().map(|r| r.groups.len()).sum();
+                            let failing: usize =
+                                self.crawl_repos.iter().map(|r| r.failing_findings).sum();
+                            let resolved = self
+                                .crawl_repos
+                                .iter()
+                                .flat_map(|repo| repo.groups.iter())
+                                .filter(|group| self.resolved.is_resolved(&group.fingerprint))
+                                .count();
 
-                let failing = result.failing_groups();
-                let resolved = result
-                    .groups
-                    .iter()
-                    .filter(|group| self.resolved.is_resolved(&group.fingerprint))
-                    .count();
+                            ui.label(format!(
+                                "Репозиториев: {} из {}",
+                                totals.scanned, totals.discovered
+                            ));
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(120, 210, 220),
+                                format!("С находками: {}", leaks),
+                            );
+                            ui.separator();
+                            ui.label(format!(
+                                "Уникальных находок: {} (всего {}), блокирующих: {}",
+                                unique,
+                                self.crawl_repos.iter().map(|r| r.findings.len()).sum::<usize>(),
+                                failing
+                            ));
+                            ui.separator();
+                            ui.label(format!("Устранено: {}", resolved));
+                            ui.separator();
+                            ui.label(format!(
+                                "Ошибок: {}, пропущено: {}",
+                                totals.failed, totals.skipped
+                            ));
+                        } else {
+                            ui.label("Укажите параметры и нажмите «Запустить краулинг».");
+                        }
+                    }
+                    GuiMode::Repository => {
+                        let Some(result) = &self.result else {
+                            ui.label("Укажите путь к репозиторию и нажмите «Сканировать».");
+                            return;
+                        };
 
-                ui.label(format!("Коммитов: {}", result.commits));
-                ui.separator();
-                ui.label(format!("Строк: {}", result.lines));
+                        let failing = result.failing_groups();
+                        let resolved = result
+                            .groups
+                            .iter()
+                            .filter(|group| self.resolved.is_resolved(&group.fingerprint))
+                            .count();
 
-                if result.skipped_lines > 0 || result.skipped_files > 0 {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 190, 90),
-                        format!(
-                            "Пропущено по лимитам: {} строк / {} файлов",
-                            result.skipped_lines, result.skipped_files
-                        ),
-                    );
+                        ui.label(format!("Коммитов: {}", result.commits));
+                        ui.separator();
+                        ui.label(format!("Строк: {}", result.lines));
+
+                        if result.skipped_lines > 0 || result.skipped_files > 0 {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 190, 90),
+                                format!(
+                                    "Пропущено по лимитам: {} строк / {} файлов",
+                                    result.skipped_lines, result.skipped_files
+                                ),
+                            );
+                        }
+
+                        ui.separator();
+                        ui.label(format!(
+                            "Уникальных находок: {} (всего {}), блокирующих: {}",
+                            result.groups.len(),
+                            result.findings.len(),
+                            failing
+                        ));
+                        ui.separator();
+                        ui.label(format!("Устранено: {}", resolved));
+                        ui.separator();
+                        ui.label(format!("Время: {:.2}s", result.duration.as_secs_f32()));
+                    }
                 }
-
-                ui.separator();
-                ui.label(format!(
-                    "Уникальных находок: {} (всего {}), блокирующих: {}",
-                    result.groups.len(),
-                    result.findings.len(),
-                    failing
-                ));
-                ui.separator();
-                ui.label(format!("Устранено: {}", resolved));
-                ui.separator();
-                ui.label(format!("Время: {:.2}s", result.duration.as_secs_f32()));
 
                 if let Some(status) = &self.export_status {
                     ui.separator();
@@ -298,7 +672,7 @@ impl GuiApp {
         });
     }
 
-    fn list_panel(&mut self, ui: &mut egui::Ui) {
+    fn scan_list_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("findings")
             .resizable(true)
             .default_size(470.0)
@@ -367,7 +741,7 @@ impl GuiApp {
                     return;
                 }
 
-                let visible = self.visible_indices();
+                let visible = self.visible_scan_indices();
 
                 if visible.is_empty() {
                     ui.add_space(12.0);
@@ -400,36 +774,13 @@ impl GuiApp {
                         for index in visible {
                             let group = &self.result.as_ref().expect("checked above").groups[index];
                             let is_resolved = self.resolved.is_resolved(&group.fingerprint);
-                            let location = group
-                                .occurrences
-                                .first()
-                                .map(|occurrence| occurrence.file_path.clone())
-                                .unwrap_or_default();
-
-                            let mut line = format!(
-                                "[{}] {}  ({})",
-                                group.severity.label(),
-                                group.rule_name,
-                                location
-                            );
-
-                            if group.commit_count > 1 {
-                                line.push_str(&format!("  · {} коммитов", group.commit_count));
-                            }
-
-                            if is_resolved {
-                                line.push_str("  · устранено");
-                            }
-
                             let response = ui.selectable_label(
                                 selected == Some(index),
-                                egui::RichText::new(truncate(&line, MAX_LIST_TEXT)).color(
-                                    if is_resolved {
-                                        egui::Color32::from_gray(130)
-                                    } else {
-                                        severity_color(group.severity)
-                                    },
-                                ),
+                                egui::RichText::new(truncate(&group_row_text(group), MAX_LIST_TEXT)).color(if is_resolved {
+                                    egui::Color32::from_gray(130)
+                                } else {
+                                    severity_color(group.severity)
+                                }),
                             );
 
                             if response.clicked() {
@@ -440,7 +791,94 @@ impl GuiApp {
             });
     }
 
-    fn detail_panel(&mut self, ui: &mut egui::Ui) {
+    fn crawl_list_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("crawl-repos")
+            .resizable(true)
+            .default_size(430.0)
+            .min_size(300.0)
+            .max_size(720.0)
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Поиск по имени:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.crawl_filter)
+                            .desired_width(180.0)
+                            .hint_text("owner/repo"),
+                    );
+                });
+
+                ui.add_space(4.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 210, 220),
+                        format!("Найдено репозиториев: {}", self.crawl_repos.len()),
+                    );
+                    ui.separator();
+                    ui.label(format!("Неудачных: {}", self.crawl_failed));
+                });
+
+                ui.separator();
+
+                if self.crawl_repos.is_empty() {
+                    ui.add_space(12.0);
+                    let message = if self.crawl.is_some() {
+                        "Сканирование идёт: первые результаты появятся выше по мере готовности."
+                    } else {
+                        "Отчёт пуст.\n\n1. Оставьте запрос пустым для случайных репозиториев.\n2. Задайте количество и глубину.\n3. Нажмите «Запустить краулинг»."
+                    };
+
+                    ui.label(egui::RichText::new(message).color(egui::Color32::from_gray(150)));
+                    return;
+                }
+
+                let visible = self.visible_crawl_indices();
+
+                if visible.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Ничего не найдено по текущим фильтрам.")
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                    return;
+                }
+
+                let selected = self.selected_repo;
+                let stored = self.resolved.clone();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for index in visible {
+                            let Some(repo) = self.crawl_repos.get(index) else {
+                                continue;
+                            };
+
+                            let text = repo_row_text(repo, &stored);
+                            let color = if repo.groups.is_empty() {
+                                egui::Color32::from_gray(140)
+                            } else {
+                                severity_color(severity_from_rank(repo.max_severity_rank()))
+                            };
+
+                            if ui
+                                .selectable_label(
+                                    selected == Some(index),
+                                    egui::RichText::new(text).color(color),
+                                )
+                                .clicked()
+                            {
+                                self.selected_repo = Some(index);
+                                self.selected_crawl_group = Some(0);
+                            }
+                        }
+                    });
+            });
+    }
+
+    fn scan_detail_panel(&mut self, ui: &mut egui::Ui) {
         let Some(result) = &self.result else {
             ui.add_space(24.0);
             ui.label(
@@ -461,126 +899,98 @@ impl GuiApp {
         };
 
         let group = &result.groups[index];
-        let is_resolved = self.resolved.is_resolved(&group.fingerprint);
+
+        render_group_details(ui, group, &mut self.resolved);
+    }
+
+    fn crawl_detail_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(repo_index) = self.selected_repo.filter(|index| *index < self.crawl_repos.len())
+        else {
+            ui.add_space(24.0);
+            ui.label(
+                egui::RichText::new(
+                    "Выберите репозиторий слева: покажу найденные в нём ключи и историю вхождений.",
+                )
+                .color(egui::Color32::from_gray(160)),
+            );
+            return;
+        };
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            ui.heading(group.rule_name.clone());
-            ui.label(
-                egui::RichText::new(group.severity.label())
-                    .color(severity_color(group.severity))
-                    .strong(),
+            ui.heading(self.crawl_repos[repo_index].repo_name.clone());
+            ui.hyperlink_to(
+                "открыть на GitHub",
+                self.crawl_repos[repo_index].clone_url.clone(),
             );
             ui.label(
-                egui::RichText::new(group.category.label())
-                    .color(egui::Color32::from_rgb(120, 200, 255)),
-            );
-            ui.label(
-                egui::RichText::new(format!("достоверность: {}", group.confidence))
-                    .color(egui::Color32::from_gray(170)),
+                egui::RichText::new(format!(
+                    "уникальных находок: {}, блокирующих: {}, время скана: {} мс",
+                    self.crawl_repos[repo_index].groups.len(),
+                    self.crawl_repos[repo_index].failing_findings,
+                    self.crawl_repos[repo_index].duration_ms
+                ))
+                .color(egui::Color32::from_gray(170)),
             );
         });
 
-        ui.add_space(6.0);
-
-        let toggle_label = if is_resolved {
-            "Снять отметку «устранено»"
-        } else {
-            "Отметить как устранённое"
-        };
-
-        if ui.button(toggle_label).clicked() {
-            self.resolved.toggle(&group.fingerprint);
-        }
-
-        ui.separator();
-
-        egui::Grid::new("finding-details")
-            .num_columns(2)
-            .spacing([18.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Секрет:");
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 120, 120),
-                    group.secret_preview.clone(),
-                );
-                ui.end_row();
-
-                ui.label("Отпечаток:");
-                ui.monospace(group.fingerprint.clone());
-                ui.end_row();
-
-                ui.label("Семейство / энтропия:");
-                ui.label(format!(
-                    "{} / {}",
-                    group.family,
-                    group
-                        .entropy
-                        .map(|entropy| format!("{:.2}", entropy))
-                        .unwrap_or_else(|| "n/a".to_string())
-                ));
-                ui.end_row();
-
-                ui.label("Встречается:");
-                ui.label(format!(
-                    "{} коммит(ов), {} файл(ов)",
-                    group.commit_count, group.file_count
-                ));
-                ui.end_row();
-
-                ui.label("Первый / последний:");
-                ui.label(format!("{}  →  {}", group.first_seen, group.last_seen));
-                ui.end_row();
-
-                ui.label("Статус:");
-                if is_resolved {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(140, 220, 140),
-                        "устранено (состояние сохраняется между запусками)",
-                    );
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(255, 150, 150), "активный риск");
-                }
-                ui.end_row();
-            });
-
-        ui.separator();
-        ui.label(
-            egui::RichText::new(format!("Вхождения ({})", group.occurrences.len()))
-                .strong()
-                .color(egui::Color32::from_gray(190)),
-        );
         ui.add_space(4.0);
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for occurrence in group.occurrences.iter().take(MAX_OCCURRENCES_SHOWN) {
-                    ui.horizontal(|ui| {
-                        ui.monospace(truncate(&occurrence.commit_id, 10));
-                        ui.colored_label(
-                            egui::Color32::from_gray(160),
-                            truncate(&occurrence.commit_date, 24),
-                        );
-                        ui.label(truncate(&occurrence.file_path, 60));
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 200, 120),
-                            format!(":{}", occurrence.line_number),
-                        );
-                        ui.colored_label(
-                            egui::Color32::from_gray(140),
-                            truncate(&occurrence.commit_author, 24),
-                        );
-                    });
-                }
+        if self.crawl_repos[repo_index].groups.is_empty() {
+            ui.label(
+                egui::RichText::new("В этом репозитории ничего не найдено.")
+                    .color(egui::Color32::from_rgb(140, 220, 140)),
+            );
+            return;
+        }
 
-                if group.occurrences.len() > MAX_OCCURRENCES_SHOWN {
-                    ui.label(format!(
-                        "… ещё {} вхождений",
-                        group.occurrences.len() - MAX_OCCURRENCES_SHOWN
-                    ));
-                }
+        egui::Panel::left("crawl-groups")
+            .resizable(true)
+            .default_size(420.0)
+            .min_size(280.0)
+            .max_size(700.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let total_groups = self.crawl_repos[repo_index].groups.len();
+
+                        for group_index in 0..total_groups {
+                            let group = &self.crawl_repos[repo_index].groups[group_index];
+                            let is_resolved = self.resolved.is_resolved(&group.fingerprint);
+
+                            if ui
+                                .selectable_label(
+                                    self.selected_crawl_group == Some(group_index),
+                                    egui::RichText::new(truncate(
+                                        &group_row_text(group),
+                                        MAX_LIST_TEXT,
+                                    ))
+                                    .color(
+                                        if is_resolved {
+                                            egui::Color32::from_gray(130)
+                                        } else {
+                                            severity_color(group.severity)
+                                        },
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.selected_crawl_group = Some(group_index);
+                            }
+                        }
+                    });
             });
+
+        let group_index = self.selected_crawl_group.unwrap_or(0);
+        let group = self.crawl_repos[repo_index]
+            .groups
+            .get(group_index)
+            .cloned();
+
+        if let Some(group) = group {
+            render_group_details(ui, &group, &mut self.resolved);
+        }
     }
 }
 
@@ -588,6 +998,7 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_scan(&ctx);
+        self.poll_crawl(&ctx);
 
         let dropped = ctx.input(|input| {
             input
@@ -600,12 +1011,204 @@ impl eframe::App for GuiApp {
 
         if let Some(path) = dropped {
             self.path_input = path.display().to_string();
+            self.mode = GuiMode::Repository;
         }
 
         self.toolbar(ui, &ctx);
         self.status_bar(ui);
-        self.list_panel(ui);
-        self.detail_panel(ui);
+
+        match self.mode {
+            GuiMode::Crawler => {
+                self.crawl_list_panel(ui);
+                self.crawl_detail_panel(ui);
+            }
+            GuiMode::Repository => {
+                self.scan_list_panel(ui);
+                self.scan_detail_panel(ui);
+            }
+        }
+    }
+}
+
+fn group_row_text(group: &FindingGroup) -> String {
+    let location = group
+        .occurrences
+        .first()
+        .map(|occurrence| occurrence.file_path.clone())
+        .unwrap_or_default();
+
+    let mut line = format!(
+        "[{}] {}  ({})",
+        group.severity.label(),
+        group.rule_name,
+        location
+    );
+
+    if group.commit_count > 1 {
+        line.push_str(&format!("  · {} коммитов", group.commit_count));
+    }
+
+    line
+}
+
+fn repo_row_text(repo: &CrawledRepo, resolved: &ResolvedState) -> String {
+    if repo.groups.is_empty() {
+        return format!("{}  · ничего не найдено", repo.repo_name);
+    }
+
+    let resolved_count = repo
+        .groups
+        .iter()
+        .filter(|group| resolved.is_resolved(&group.fingerprint))
+        .count();
+
+    let mut text = format!(
+        "{}  · {} находок ({} блокирующих)",
+        repo.repo_name,
+        repo.groups.len(),
+        repo.failing_findings
+    );
+
+    if resolved_count > 0 {
+        text.push_str(&format!(", устранено {}", resolved_count));
+    }
+
+    text
+}
+
+fn render_group_details(
+    ui: &mut egui::Ui,
+    group: &FindingGroup,
+    resolved: &mut ResolvedState,
+) {
+    let is_resolved = resolved.is_resolved(&group.fingerprint);
+
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.heading(group.rule_name.clone());
+        ui.label(
+            egui::RichText::new(group.severity.label())
+                .color(severity_color(group.severity))
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(group.category.label()).color(egui::Color32::from_rgb(120, 200, 255)),
+        );
+        ui.label(
+            egui::RichText::new(format!("достоверность: {}", group.confidence))
+                .color(egui::Color32::from_gray(170)),
+        );
+    });
+
+    ui.add_space(6.0);
+
+    let toggle_label = if is_resolved {
+        "Снять отметку «устранено»"
+    } else {
+        "Отметить как устранённое"
+    };
+
+    if ui.button(toggle_label).clicked() {
+        resolved.toggle(&group.fingerprint);
+    }
+
+    ui.separator();
+
+    egui::Grid::new(format!("finding-details-{}", group.fingerprint))
+        .num_columns(2)
+        .spacing([18.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Секрет:");
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 120, 120),
+                group.secret_preview.clone(),
+            );
+            ui.end_row();
+
+            ui.label("Отпечаток:");
+            ui.monospace(group.fingerprint.clone());
+            ui.end_row();
+
+            ui.label("Семейство / энтропия:");
+            ui.label(format!(
+                "{} / {}",
+                group.family,
+                group
+                    .entropy
+                    .map(|entropy| format!("{:.2}", entropy))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            ui.end_row();
+
+            ui.label("Встречается:");
+            ui.label(format!(
+                "{} коммит(ов), {} файл(ов)",
+                group.commit_count, group.file_count
+            ));
+            ui.end_row();
+
+            ui.label("Первый / последний:");
+            ui.label(format!("{}  →  {}", group.first_seen, group.last_seen));
+            ui.end_row();
+
+            ui.label("Статус:");
+            if is_resolved {
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 220, 140),
+                    "устранено (состояние сохраняется между запусками)",
+                );
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(255, 150, 150), "активный риск");
+            }
+            ui.end_row();
+        });
+
+    ui.separator();
+    ui.label(
+        egui::RichText::new(format!("Вхождения ({})", group.occurrences.len()))
+            .strong()
+            .color(egui::Color32::from_gray(190)),
+    );
+    ui.add_space(4.0);
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for occurrence in group.occurrences.iter().take(MAX_OCCURRENCES_SHOWN) {
+                ui.horizontal(|ui| {
+                    ui.monospace(truncate(&occurrence.commit_id, 10));
+                    ui.colored_label(
+                        egui::Color32::from_gray(160),
+                        truncate(&occurrence.commit_date, 24),
+                    );
+                    ui.label(truncate(&occurrence.file_path, 60));
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 200, 120),
+                        format!(":{}", occurrence.line_number),
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_gray(140),
+                        truncate(&occurrence.commit_author, 24),
+                    );
+                });
+            }
+
+            if group.occurrences.len() > MAX_OCCURRENCES_SHOWN {
+                ui.label(format!(
+                    "… ещё {} вхождений",
+                    group.occurrences.len() - MAX_OCCURRENCES_SHOWN
+                ));
+            }
+        });
+}
+
+fn severity_from_rank(rank: u8) -> Severity {
+    match rank {
+        4 => Severity::Critical,
+        3 => Severity::High,
+        2 => Severity::Medium,
+        1 => Severity::Low,
+        _ => Severity::Info,
     }
 }
 

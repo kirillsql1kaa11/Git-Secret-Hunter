@@ -8,7 +8,7 @@ use candidates::extract_candidates;
 use entropy::{analyze_candidate, calculate_shannon_entropy, classify_family};
 use filters::{
     evaluate_context_lower, has_hash_context, has_secret_keyword, is_false_positive_token,
-    is_ignored_path, ContextScore,
+    is_ignored_path, looks_like_artifact_name, ContextScore,
 };
 use rules::{RuleCategory, RuleRegistry};
 use serde::{Deserialize, Serialize};
@@ -160,6 +160,10 @@ impl Scanner {
                 let candidate_lower = candidate.to_lowercase();
 
                 if is_false_positive_token(&candidate_lower, hash_context) {
+                    continue;
+                }
+
+                if looks_like_artifact_name(&candidate_lower) {
                     continue;
                 }
 

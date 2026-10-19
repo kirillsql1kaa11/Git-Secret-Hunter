@@ -64,6 +64,32 @@ const SECRET_KEYWORDS: [&str; 28] = [
     "salt",
 ];
 
+pub fn looks_like_artifact_name(token_lower: &str) -> bool {
+    const EXTENSIONS: [&str; 40] = [
+        "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "whl", "jar", "exe", "msi", "dll",
+        "so", "dylib", "js", "mjs", "cjs", "css", "map", "json", "yml", "yaml", "toml", "lock",
+        "md", "txt", "log", "csv", "xml", "ico", "png", "jpg", "jpeg", "gif", "svg", "html", "htm",
+        "sql", "pem",
+    ];
+
+    let Some((name, extension)) = token_lower.rsplit_once('.') else {
+        return false;
+    };
+
+    if name.is_empty() || extension.is_empty() {
+        return false;
+    }
+
+    if extension
+        .chars()
+        .all(|character| character.is_ascii_digit())
+    {
+        return true;
+    }
+
+    EXTENSIONS.contains(&extension)
+}
+
 pub fn is_ignored_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_lowercase();
 

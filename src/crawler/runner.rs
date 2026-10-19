@@ -97,9 +97,13 @@ impl<'a> CrawlerRunner<'a> {
     }
 
     fn scan_repo(&self, repo: &GitHubRepo, pb: &ProgressBar) -> Option<RepoScanSummary> {
-        let repo_start = Instant::now();
-
         pb.set_message(format!("Auditing: {}", repo.full_name));
+
+        self.scan_repo_detached(repo)
+    }
+
+    pub fn scan_repo_detached(&self, repo: &GitHubRepo) -> Option<RepoScanSummary> {
+        let repo_start = Instant::now();
 
         let temp_dir = tempdir().ok()?;
         let target = temp_dir.path().to_str()?.to_string();
