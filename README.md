@@ -33,7 +33,7 @@
 ### Вариант 1. Готовые бинарные файлы (Рекомендуется)
 
 1. Перейдите на страницу [Релизов](https://github.com/kirillsql1kaa11/Git-Secret-Hunter/releases).
-2. Скачайте архив для Windows: `git-secret-hunter-v0.2.0-windows-x64.zip`.
+2. Скачайте архив для Windows: `git-secret-hunter-v0.3.0-windows-x64.zip`.
 3. Распакуйте архив в любую удобную папку. Внутри два файла:
    - `git-secret-hunter.exe` — консольный сканер (CLI + TUI);
    - `git-secret-hunter-gui.exe` — оконное приложение.
