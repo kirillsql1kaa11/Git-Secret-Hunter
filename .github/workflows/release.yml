@@ -19,20 +19,27 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
+      - name: Run tests
+        run: cargo test
+
+      - name: Build CLI binary
         run: cargo build --release
+
+      - name: Build GUI binary
+        run: cargo build --release --features gui --bin git-secret-hunter-gui
 
       - name: Package Windows artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-dist
           Copy-Item target/release/git-secret-hunter.exe release-dist/
+          Copy-Item target/release/git-secret-hunter-gui.exe release-dist/
           Copy-Item README.md release-dist/
           Copy-Item LICENSE release-dist/
-          Compress-Archive -Path release-dist/* -DestinationPath git-secret-hunter-windows-x64.zip
+          Compress-Archive -Path release-dist/* -DestinationPath "git-secret-hunter-$env:GITHUB_REF_NAME-windows-x64.zip"
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: git-secret-hunter-windows-x64.zip
+          files: git-secret-hunter-${{ github.ref_name }}-windows-x64.zip
           generate_release_notes: true
